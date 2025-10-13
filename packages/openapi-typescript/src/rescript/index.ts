@@ -8,6 +8,13 @@ function isRef(s: any): s is ReferenceObject {
   return s && typeof s === "object" && typeof s.$ref === "string";
 }
 
+function stripLastComma(lines: string[]): string[] {
+  if (!Array.isArray(lines) || lines.length === 0) return lines;
+  const out = [...lines];
+  out[out.length - 1] = out[out.length - 1]!.replace(/,\s*$/, "");
+  return out;
+}
+
 function mapPrimitive(schema: SchemaObject): string | undefined {
   const t = schema.type;
   if (t === "string") return "string";
@@ -21,6 +28,14 @@ function mapSchemaToRes(
   ctx: RSContext,
   { parentName, collectAux }: { parentName?: string; collectAux?: (name: string, body: string) => void } = {},
 ): string {
+  // Shared helper: register an allOf fallback alias with a standardized doc block
+  const collectAllOfFallback = (reason: string): string => {
+    const aux = toValidTypeName(`${parentName ?? "t"}__allOf_fallback`);
+    const doc = wrapBlockDoc(`TODO: cannot safely merge allOf: ${reason}`);
+    const body = `${doc ? doc + "\n" : ""}JSON.t`;
+    if (typeof collectAux === "function") collectAux(aux, body);
+    return aux;
+  };
   if (isRef(schema)) {
     const ref = schema.$ref;
     // Handle references to $defs: map to `<parent>__def_<name>` pattern so that cross-schema refs work
@@ -86,8 +101,14 @@ function mapSchemaToRes(
   // arrays
   if (schema.type === "array") {
     const it = (schema.items as SchemaLike) ?? ({} as SchemaObject);
-    const inner = mapSchemaToRes(it, ctx, { parentName, collectAux });
-    return schema.nullable ? `Null.t<array<${inner}>>` : `array<${inner}>`;
+    let inner = mapSchemaToRes(it, ctx, { parentName, collectAux });
+    if (/^\s*\{/.test(inner) && typeof collectAux === "function") {
+      const base = toValidTypeName(`${parentName ?? "t"}_item`);
+      collectAux(base, inner);
+      inner = base;
+    }
+    const arr = `array<${inner}>`;
+    return schema.nullable ? `Null.t<${arr}>` : arr;
   }
 
   // composition: oneOf / anyOf → PV union wrapped in Wrapped.t when possible
@@ -243,12 +264,27 @@ function mapSchemaToRes(
       if (ap === false) {
         return schema.nullable ? `Null.t<emptyObject>` : `emptyObject`;
       }
-      const inner = mapSchemaToRes(ap as SchemaLike, ctx, { parentName, collectAux });
-      return schema.nullable ? `Null.t<dict<${inner}>>` : `dict<${inner}>`;
+      let inner = mapSchemaToRes(ap as SchemaLike, ctx, { parentName, collectAux });
+      if (/^\s*\{/.test(inner) && typeof collectAux === "function") {
+        const base = toValidTypeName(`${parentName ?? "t"}_value`);
+        collectAux(base, inner);
+        inner = base;
+      }
+      const dict = `dict<${inner}>`;
+      return schema.nullable ? `Null.t<${dict}>` : dict;
     }
 
     for (const [propName, propSchema] of Object.entries(props)) {
-      const mapped = mapSchemaToRes(propSchema as SchemaLike, ctx, { parentName, collectAux });
+      let mapped = mapSchemaToRes(propSchema as SchemaLike, ctx, { parentName, collectAux });
+      // Avoid deep inline-record nesting: hoist inline records as aux types when possible
+      if (/^\s*\{/.test(mapped) && typeof collectAux === "function") {
+        const baseParent = parentName ?? "t";
+        const propBase = toValidTypeName(`${baseParent}_${propName}`);
+        // Ensure we don't clash within this object scope by suffixing if needed
+        let auxName = propBase;
+        collectAux(auxName, mapped);
+        mapped = auxName;
+      }
       const isReq = required.has(propName);
       const { rendered, attr } = toValidResFieldName(propName);
       // naive unique handling: suffix if duplicate
@@ -258,35 +294,281 @@ function mapSchemaToRes(
       used.add(name);
       const sep = isReq ? ": " : "?: ";
       const line = `${attr ?? ""}${name}${sep}${mapped},`;
+      const propDoc = wrapBlockDoc((propSchema as any)?.description);
+      if (propDoc) fields.push(propDoc);
       fields.push(line);
     }
     const body = `\n{\n${indentLines(fields, 2)}\n}`;
-    return schema.nullable ? `Null.t<${body}>` : body;
+    if (schema.nullable) {
+      if (typeof collectAux === "function") {
+        const auxName = toValidTypeName(`${parentName ?? "t"}__shape`);
+        collectAux(auxName, body);
+        return `Null.t<${auxName}>`;
+      }
+      return `Null.t<${body}>`;
+    }
+    return body;
   }
 
-  // composition: allOf → merge object properties where possible; others unknown
-  if (Array.isArray(schema.allOf) && schema.allOf.length > 0) {
-    // Try to merge object-like members
-    const members = schema.allOf as SchemaLike[];
-    const fields: string[] = [];
-    const used = new Set<string>();
-    for (const member of members) {
-      const mapped = mapSchemaToRes(member, ctx, { parentName, collectAux });
-      // If member rendered as inline record { .. }, extract fields
+  // composition: allOf → merge object-like members where possible; otherwise fallback alias with TODO
+  if (Array.isArray((schema as any).allOf) && (schema as any).allOf.length > 0) {
+    const members = (schema as any).allOf as SchemaLike[];
+
+    const tryInlineObject = (s: any): any | undefined => {
+      if (!s || typeof s !== "object") return undefined;
+      if (Array.isArray((s as any).allOf) && (s as any).allOf.length > 0) {
+        // recursively treat nested allOf as object-like if it produces object members
+        const nested = (s as any).allOf as any[];
+        for (const m of nested) {
+          const obj = tryInlineObject((m as any)?.$ref ? ctx.resolve((m as any).$ref) : m);
+          if (obj) return obj;
+        }
+      }
+      if (s.type === "object" || s.properties || s.additionalProperties) return s;
+      return undefined;
+    };
+
+    const isAnnotationOnly = (s: any): boolean => {
+      if (!s || typeof s !== "object") return false;
+      const keys = Object.keys(s);
+      const structural = ["type", "properties", "required", "additionalProperties", "oneOf", "anyOf", "allOf", "$ref", "items", "enum", "const", "patternProperties"];
+      const onlyAnn = keys.every((k) => ["title", "description", "deprecated", "readOnly", "writeOnly", "examples", "example"].includes(k));
+      return onlyAnn;
+    };
+
+    const isPVUnion = (t: string): boolean => /^\[\s*#/.test(t.trim());
+    const isNullWrapped = (t: string): boolean => /^\s*Null\.t</.test(t);
+    const unwrapNull = (t: string): string => (isNullWrapped(t) ? t.replace(/^\s*Null\.t</, "").replace(/>\s*$/, "") : t);
+    const isArrayType = (t: string): { ok: true; inner: string } | { ok: false } => {
+      const m = t.trim().match(/^array<(.+)>$/);
+      return m ? { ok: true, inner: m[1]!.trim() } : { ok: false };
+    };
+    const parsePV = (t: string): string[] | undefined => {
+      const m = t.trim().match(/^\[\s*(.+)\s*\]$/);
+      if (!m) return undefined;
+      return m[1]!
+        .split("|")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    };
+
+    const chooseNarrower = (aTy: string, bTy: string): "a" | "b" | undefined => {
+      if (aTy === bTy) return "a";
+      // Null-wrapped preference
+      const aNull = isNullWrapped(aTy);
+      const bNull = isNullWrapped(bTy);
+      if (aNull && !bNull) return "a";
+      if (bNull && !aNull) return "b";
+      // Array inner preference (recurse on inner)
+      const aArr = isArrayType(unwrapNull(aTy));
+      const bArr = isArrayType(unwrapNull(bTy));
+      if (aArr.ok && bArr.ok) {
+        const res = chooseNarrower(aArr.inner, bArr.inner);
+        return res ?? "a";
+      }
+      // PV union is narrower than string/float
+      if ((aTy === "string" && isPVUnion(bTy)) || (aTy === "float" && isPVUnion(bTy))) return "b";
+      if ((bTy === "string" && isPVUnion(aTy)) || (bTy === "float" && isPVUnion(aTy))) return "a";
+      // Alias vs primitive: prefer alias (more informative)
+      const prim = new Set(["string", "float", "bool", "unknown", "JSON.t"]);
+      const isAlias = (t: string): boolean => {
+        if (prim.has(t)) return false;
+        if (isPVUnion(t)) return false;
+        if (isArrayType(t).ok) return false;
+        return /^[A-Za-z_][A-Za-z0-9_]*$/.test(t.trim());
+      };
+      const aAlias = isAlias(aTy);
+      const bAlias = isAlias(bTy);
+      if (aAlias && !bAlias) return "a";
+      if (bAlias && !aAlias) return "b";
+      if (aAlias && bAlias) return "a";
+      return undefined;
+    };
+
+    const isArraySchema = (s: any): any | undefined => {
+      if (!s || typeof s !== "object") return undefined;
+      if (s.type === "array" || (s.items != null) || Array.isArray((s as any).prefixItems)) return s;
+      if (Array.isArray((s as any).allOf)) {
+        // See if any nested allOf member is an array
+        for (const m of (s as any).allOf as any[]) {
+          const inner = (m as any)?.$ref ? ctx.resolve((m as any).$ref) : m;
+          const got = isArraySchema(inner);
+          if (got) return got;
+        }
+      }
+      return undefined;
+    };
+
+    const isScalarSchema = (s: any): boolean => {
+      if (!s || typeof s !== "object") return false;
+      if (typeof (s as any).const !== "undefined") return true;
+      if (Array.isArray((s as any).enum)) return true;
+      const t = (s as any).type;
+      return t === "string" || t === "number" || t === "integer" || t === "boolean";
+    };
+
+    const resolved: any[] = members.map((m) => ((m as any)?.$ref ? ctx.resolve((m as any).$ref) : m));
+    const topNullable = !!((schema as any)?.nullable) || resolved.some((r) => !!(r as any)?.nullable);
+    // ignore purely annotation members
+    const filtered = resolved.filter((r) => !isAnnotationOnly(r));
+    const objectLikes = filtered.map((r) => tryInlineObject(r)).filter(Boolean) as any[];
+
+    // If we have array-like members (and no object-like), merge arrays by narrowing item type
+    const arrayLikes = filtered.map((r) => isArraySchema(r)).filter(Boolean) as any[];
+    if (arrayLikes.length > 0 && objectLikes.length === 0) {
+      let itemType: string | undefined = undefined;
+      for (const a of arrayLikes) {
+        const it = (a as any).items as SchemaLike | undefined;
+        const mapped = it ? mapSchemaToRes(it, ctx, { parentName, collectAux }) : "unknown";
+        if (itemType == null) {
+          itemType = mapped;
+        } else if (itemType !== mapped) {
+          const pref = chooseNarrower(itemType, mapped);
+          if (pref === "b") itemType = mapped;
+          // if pref === "a" keep existing; if undefined, keep existing to avoid widening
+        }
+      }
+      const arr = `array<${itemType ?? "unknown"}>`;
+      if (topNullable) {
+        if (typeof collectAux === "function") {
+          const auxName = toValidTypeName(`${parentName ?? "t"}__shape`);
+          collectAux(auxName, arr);
+          return `Null.t<${auxName}>`;
+        }
+        return `Null.t<${arr}>`;
+      }
+      return arr;
+    }
+
+    // If all remaining are scalar-like, compute a narrowed scalar type
+    const scalarLikes = filtered.filter((r) => isScalarSchema(r));
+    if (scalarLikes.length > 0 && objectLikes.length === 0) {
+      // Collect enums/consts
+      const sets: Array<Set<string>> = [];
+      let base: "string" | "float" | "bool" | undefined = undefined;
+      for (const s of scalarLikes) {
+        if (Array.isArray((s as any).enum) && (s as any).enum.length > 0) {
+          const vals = (s as any).enum.map((v: any) => `#${JSON.stringify(String(v))}`);
+          sets.push(new Set(vals));
+          base = base ?? (typeof (s as any).type === "string" && ((s as any).type === "number" || (s as any).type === "integer") ? "float" : (s as any).type === "boolean" ? "bool" : "string");
+        } else if (typeof (s as any).const !== "undefined") {
+          const v = `#${JSON.stringify(String((s as any).const))}`;
+          sets.push(new Set([v]));
+          base = base ?? "string";
+        } else if (typeof (s as any).type === "string") {
+          const t = (s as any).type;
+          if (t === "number" || t === "integer") base = base ?? "float";
+          else if (t === "boolean") base = base ?? "bool";
+          else base = base ?? "string";
+        }
+      }
+      let ty: string | undefined = undefined;
+      if (sets.length > 0) {
+        // Intersect all sets
+        let acc = sets[0]!;
+        for (let i = 1; i < sets.length; i++) {
+          const nxt = sets[i]!;
+          acc = new Set([...acc].filter((x) => nxt.has(x)));
+        }
+        if (acc.size > 0) {
+          const pv = `[${[...acc].sort().join(" | ")}]`;
+          ty = pv;
+        }
+      }
+      if (!ty) {
+        ty = base ?? "unknown";
+      }
+      return topNullable ? `Null.t<${ty}>` : ty;
+    }
+
+    if (objectLikes.length > 0) {
+      const required = new Set<string>();
+      const baseProps: Record<string, any> = {};
+      // Merge properties from all object-like members
+      for (const obj of objectLikes) {
+        const req = Array.isArray(obj.required) ? obj.required : [];
+        for (const r of req) required.add(r);
+        const props = obj.properties ?? {};
+        for (const [k, v] of Object.entries(props)) {
+          if (baseProps[k] == null) baseProps[k] = v;
+          else {
+            const aTy = mapSchemaToRes(baseProps[k] as SchemaLike, ctx, { parentName, collectAux });
+            const bTy = mapSchemaToRes(v as SchemaLike, ctx, { parentName, collectAux });
+            if (aTy !== bTy) {
+              const pref = chooseNarrower(aTy, bTy);
+              if (pref === "a") {
+                // keep existing
+                continue;
+              } else if (pref === "b") {
+                baseProps[k] = v;
+                continue;
+              } else {
+                // Conservative default: keep existing to avoid fallback
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      // Build merged record
+      const fields: string[] = [];
+      const used = new Set<string>();
+      for (const [propName, propSchema] of Object.entries(baseProps)) {
+        let mapped = mapSchemaToRes(propSchema as SchemaLike, ctx, { parentName, collectAux });
+        if (/^\s*\{/.test(mapped) && typeof collectAux === "function") {
+          const auxName = toValidTypeName(`${parentName ?? "t"}_${String(propName)}`);
+          collectAux(auxName, mapped);
+          mapped = auxName;
+        }
+        const isReq = required.has(propName);
+        const { rendered, attr } = toValidResFieldName(propName);
+        let name = rendered;
+        let i = 2;
+        while (used.has(name)) name = `${rendered}__${i++}`;
+        used.add(name);
+        const sep = isReq ? ": " : "?: ";
+        fields.push(`${attr ?? ""}${name}${sep}${mapped},`);
+      }
+      const body = `\n{\n${indentLines(fields, 2)}\n}`;
+      if (topNullable) {
+        if (typeof collectAux === "function") {
+          const auxName = toValidTypeName(`${parentName ?? "t"}__shape`);
+          collectAux(auxName, body);
+          return `Null.t<${auxName}>`;
+        }
+        return `Null.t<${body}>`;
+      }
+      return body;
+    }
+
+    // Fallback: attempt concatenation of object-like members while skipping scalars/annotations
+    const lines: string[] = [];
+    for (const r of filtered) {
+      const obj = tryInlineObject(r);
+      if (!obj) continue;
+      const mapped = mapSchemaToRes(obj as SchemaLike, ctx, { parentName, collectAux });
       const m = mapped.trim();
       if (m.startsWith("{") || m.startsWith("{\n")) {
         const body = m.replace(/^\{\n?/, "").replace(/\n?\}$/, "");
-        for (const line of body.split("\n").filter(Boolean)) {
-          // Keep as-is; ensure uniqueness by suffixing name if needed later (best-effort)
-          fields.push(line);
-        }
-      } else {
-        // Non-object member; bail out to unknown for now
-        return "unknown";
+        for (const line of body.split("\n").filter(Boolean)) lines.push(line);
       }
     }
-    const body = `\n{\n${fields.join("\n")}\n}`;
-    return schema.nullable ? `Null.t<${body}>` : body;
+    if (lines.length > 0) {
+      const body = `\n{\n${lines.join("\n")}\n}`;
+      if (topNullable) {
+        if (typeof collectAux === "function") {
+          const auxName = toValidTypeName(`${parentName ?? "t"}__shape`);
+          collectAux(auxName, body);
+          return `Null.t<${auxName}>`;
+        }
+        return `Null.t<${body}>`;
+      }
+      return body;
+    }
+
+    if (typeof collectAux === "function") return collectAllOfFallback("non-object member(s)");
+    return "JSON.t";
   }
 
   return "unknown";
@@ -343,6 +625,16 @@ function renderComponentsSchemas(components: ComponentsObject | undefined, ctx: 
       decls.push(decl);
       if (aux.length > 0) {
         for (const t of aux) {
+          // If body starts with a doc block, lift it before the type declaration
+          if (t.body.trimStart().startsWith("/**")) {
+            const idx = t.body.indexOf("*/");
+            if (idx >= 0) {
+              const doc = t.body.slice(0, idx + 2);
+              const rest = t.body.slice(idx + 2).trimStart();
+              decls.push(`${doc}\nand ${t.name} = ${rest}`);
+              continue;
+            }
+          }
           decls.push(`and ${t.name} = ${t.body}`);
         }
       }
@@ -383,6 +675,34 @@ function renderComponentsSchemas(components: ComponentsObject | undefined, ctx: 
     lines.push(indentLines(`type response = emptyObject`, 4));
   }
   lines.push(indentLines("}", 2));
+  // Security schemes submodule (types only)
+  lines.push(indentLines("module Security = {", 2));
+  const sec: Record<string, any> = (components as any)?.securitySchemes ?? {};
+  const secEntries = Object.entries(sec);
+  if (secEntries.length > 0) {
+    for (const [name, schemeLike] of secEntries) {
+      const typeName = toValidTypeName(name);
+      // Model as emptyObject by default; attach doc of scheme type + details
+      let doc: string | undefined;
+      const s = (schemeLike as any)?.$ref ? ctx.resolve((schemeLike as any).$ref) : schemeLike;
+      if (s && typeof s === "object") {
+        const parts: string[] = [];
+        if (typeof (s as any).type === "string") parts.push(`type: ${(s as any).type}`);
+        if (typeof (s as any).scheme === "string") parts.push(`scheme: ${(s as any).scheme}`);
+        if (typeof (s as any).name === "string") parts.push(`name: ${(s as any).name}`);
+        if (typeof (s as any).in === "string") parts.push(`in: ${(s as any).in}`);
+        if (typeof (s as any).openIdConnectUrl === "string") parts.push(`openIdConnectUrl: ${(s as any).openIdConnectUrl}`);
+        if ((s as any).flows) parts.push(`flows: defined`);
+        if (parts.length > 0) doc = wrapBlockDoc(parts.join("; "));
+      }
+      if (doc) lines.push(indentLines(doc, 4));
+      lines.push(indentLines(`type ${typeName} = emptyObject`, 4));
+    }
+  }
+  else {
+    lines.push(indentLines(`type _none = emptyObject`, 4));
+  }
+  lines.push(indentLines("}", 2));
   lines.push("}");
   return lines;
 }
@@ -391,6 +711,8 @@ export function emitReScript(schema: OpenAPI3, ctx: RSContext): string {
   const out: string[] = [];
   // Use the same header format; it’s valid ReScript doc comment
   out.push(COMMENT_HEADER.trimEnd());
+  // Silence selected warnings from generated code
+  out.push('@@warning("-30")');
   // Bring OpenAPIFetch helpers (emptyObject, Wrapped, etc.) into scope
   out.push("open OpenAPIFetch\n");
 
@@ -438,8 +760,7 @@ function resolveOperation(op: OperationObject | ReferenceObject | undefined, ctx
 function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RSContext): string[] {
   const lines: string[] = [];
   lines.push("module Operations = {");
-  // Bring Components submodules (Schemas, Parameters, Headers, Responses) into scope
-  lines.push(indentLines("open Components", 2));
+  // Avoid 'open Components'; prefer fully-qualified references for clarity
 
   function emitForContainer(container: any) {
     if (!(container && typeof container === "object")) return;
@@ -464,6 +785,20 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
         else opName = `${String(p)}_${String(m)}`;
         const mod = toValidModuleName(opName);
         lines.push(indentLines(`module ${mod} = {`, 2));
+        // Security requirements doc (if any)
+        const secReq = ((op as any)?.security ?? (item as any)?.security) as any;
+        if (Array.isArray(secReq) && secReq.length > 0) {
+          const parts: string[] = [];
+          for (const req of secReq) {
+            if (!req || typeof req !== "object") continue;
+            for (const [scheme, scopes] of Object.entries(req as Record<string, any>)) {
+              const list = Array.isArray(scopes) && scopes.length > 0 ? ` [${(scopes as any[]).join(", ")}]` : "";
+              parts.push(`${scheme}${list}`);
+            }
+          }
+          const doc = wrapBlockDoc(parts.length > 0 ? `security: ${parts.join("; ")}` : undefined);
+          if (doc) lines.push(indentLines(doc, 4));
+        }
         // PARAMETERS: collect from path-level + op-level
         const allParams: (any)[] = [];
         const pathParams = (item as any)?.parameters as (any[] | undefined);
@@ -488,6 +823,8 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
           }
           const fname = toValidResFieldName(name);
           const sep = required ? ": " : "?: ";
+          const pdoc = wrapBlockDoc((param as any)?.description);
+          if (pdoc) groups[where].push(pdoc);
           groups[where].push(`${fname.attr ?? ""}${fname.rendered}${sep}${ty},`);
           present.add(where);
         }
@@ -524,8 +861,49 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
             }
             if (!chosen && entries.length === 1) chosen = entries[0]![1];
             if (chosen && typeof chosen === "object" && chosen.schema) {
-              const mapped = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
-              bodyType = mapped;
+              // Pass a parentName + collector so inline union members get hoisted to aux types
+              const aux: Array<{ name: string; body: string }> = [];
+              const base = toValidTypeName(`${mod}_request_body`);
+              const mapped = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {
+                parentName: base,
+                collectAux: (n, b) => aux.push({ name: n, body: b }),
+              });
+              if (aux.length > 0) {
+                for (const t of aux) {
+                  const trimmed = t.body.trimStart();
+                  if (trimmed.startsWith("/**")) {
+                    const idx = trimmed.indexOf("*/");
+                    if (idx >= 0) {
+                      const doc = trimmed.slice(0, idx + 2);
+                      const rest = trimmed.slice(idx + 2).trimStart();
+                      lines.push(indentLines(doc, 4));
+                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
+                      continue;
+                    }
+                  }
+                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                }
+              }
+              // Never inline record types directly in field positions; use a named aux type
+              if (/^\s*\{/.test(mapped)) {
+                const trimmed = mapped.trimStart();
+                if (trimmed.startsWith("/**")) {
+                  const idx = trimmed.indexOf("*/");
+                  if (idx >= 0) {
+                    const doc = trimmed.slice(0, idx + 2);
+                    const rest = trimmed.slice(idx + 2).trimStart();
+                    lines.push(indentLines(doc, 4));
+                    lines.push(indentLines(`type ${base} = ${rest}`, 4));
+                  } else {
+                    lines.push(indentLines(`type ${base} = ${mapped}`, 4));
+                  }
+                } else {
+                  lines.push(indentLines(`type ${base} = ${mapped}`, 4));
+                }
+                bodyType = base;
+              } else {
+                bodyType = mapped;
+              }
             } else {
               // if we can't detect a schema, default to JSON.t to signal presence of a body
               bodyType = "JSON.t";
@@ -560,6 +938,21 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
         const addSuccessAuxType = (name: string, body: string) => {
           if (!successAuxTypes.some((t) => t.name === name)) successAuxTypes.push({ name, body });
         };
+        const headerTypeDefs: { name: string; body: string }[] = [];
+        const emitTypeWithDoc = (indent: number, name: string, body: string) => {
+          const trimmed = body.trimStart();
+          if (trimmed.startsWith("/**")) {
+            const idx = trimmed.indexOf("*/");
+            if (idx >= 0) {
+              const doc = trimmed.slice(0, idx + 2);
+              const rest = trimmed.slice(idx + 2).trimStart();
+              lines.push(indentLines(doc, indent));
+              lines.push(indentLines(`type ${name} = ${rest}`, indent));
+              return;
+            }
+          }
+          lines.push(indentLines(`type ${name} = ${body}`, indent));
+        };
 
         if (responses && typeof responses === "object") {
           // Collect success bodies for flattening case as well
@@ -586,7 +979,13 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
               for (const [k, v] of entries) { if (k === "application/json") { chosen = v; break; } }
               if (!chosen && entries.length === 1) chosen = entries[0]![1];
               if (chosen && chosen.schema) {
-                body = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
+                // For response bodies, pass a parentName + collector to hoist inline union members
+                const base = toValidTypeName(`status_${status}_body`);
+                const auxLocal: Array<{ name: string; body: string }> = [];
+                body = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {
+                  parentName: base,
+                  collectAux: (n, b) => addSuccessAuxType(n, b),
+                });
               } else {
                 body = "unknown";
               }
@@ -595,6 +994,41 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
             }
 
             if (is2xx) bodies.push({ code: status, ty: body ?? "unknown" });
+
+            // Build per-status headers type
+            const headersVal = resolved && typeof resolved === "object" ? (resolved as any).headers : undefined;
+            const headerTypeName = toValidTypeName(`status_${isDefault ? "default" : status}_headers`);
+            if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
+              let headerBody: string;
+              if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
+                const fields: string[] = [];
+                for (const [hname, hlike] of Object.entries(headersVal)) {
+                  const header = (hlike && typeof hlike === "object" && (hlike as any).$ref) ? ctx.resolve((hlike as any).$ref) : hlike;
+                  let actual: string = "string";
+                  if (header && typeof header === "object") {
+                    if ((header as any).schema) {
+                      actual = mapSchemaToRes((header as any).schema as SchemaLike, ctx, {});
+                    } else if ((header as any).content && typeof (header as any).content === "object") {
+                      const ents = Object.entries((header as any).content) as Array<[string, any]>;
+                      const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
+                      const chosen = chosenEntry?.[1];
+                      if (chosen && chosen.schema) actual = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
+                      else actual = "unknown";
+                    }
+                  }
+                  const fn = toValidResFieldName(hname);
+                  if (actual !== "string") {
+                    const doc = wrapBlockDoc(`actual: ${actual}`);
+                    if (doc) fields.push(doc);
+                  }
+                  fields.push(`${fn.attr ?? ""}${fn.rendered}?: string,`);
+                }
+                headerBody = `\n{\n${indentLines(fields, 2)}\n}`;
+              } else {
+                headerBody = `emptyObject`;
+              }
+              headerTypeDefs.push({ name: headerTypeName, body: headerBody });
+            }
 
             // Constructor naming similar to src/main.ts
             const ctorBase = refNameForCtor ?? "Data";
@@ -614,9 +1048,9 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                 addSuccessAuxType(auxName, payload);
                 payload = auxName;
               }
-              const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: Components.Headers.response})`;
+              const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
               successVariants.push(variant);
-              successPayloadTypes.push(body ?? "unknown");
+              successPayloadTypes.push(payload);
               successStatusCodes.push(status);
             } else {
               // error variants: tagged by status/default, payload under `error`
@@ -634,31 +1068,46 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                 addAuxType(auxName, payload);
                 payload = auxName;
               }
-              const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: Components.Headers.response})`;
+              const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
               errorVariants.push(variant);
             }
           }
-          if (bodies.length === 1) singleSuccess = bodies[0];
+          // we no longer flatten single-success; always emit status-tagged variants
         }
 
-        // Emit any aux types derived from inline record payloads
-        if (auxTypes.length > 0) {
-          for (const t of auxTypes) {
+        // Emit per-status header types
+        if (headerTypeDefs.length > 0) {
+          for (const t of headerTypeDefs) {
             lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
           }
         }
 
-        if (singleSuccess && successVariants.length <= 1) {
-          const statusCtor = `[#${singleSuccess.code}]`;
-          const rec = `{data: ${singleSuccess.ty}, response: Response.t, headers: Components.Headers.response, status: ${statusCtor}}`;
-          lines.push(indentLines(`type success = ${rec}`, 4));
+        // Emit any aux types derived from inline record payloads
+        if (auxTypes.length > 0) {
+          for (const t of auxTypes) emitTypeWithDoc(4, t.name, t.body);
+        }
+
+        // per-operation status alias (success 2xx codes)
+        if (successStatusCodes.length > 0) {
+          const uniq = Array.from(new Set(successStatusCodes));
+          const sorted = uniq.sort((a, b) => Number(a) - Number(b));
+          const pv = sorted.map((s) => `#${s}`).join(" | ");
+          lines.push(indentLines(`type status = [${pv}]`, 4));
+        }
+        // Emit aux types needed for success payloads
+        if (successAuxTypes.length > 0) {
+          for (const t of successAuxTypes) emitTypeWithDoc(4, t.name, t.body);
+        }
+        if (successVariants.length === 1) {
+          // Flatten single-success into a record for ergonomics/parity
+          const fields: string[] = [
+            `data: ${successPayloadTypes[0] ?? "unknown"},`,
+            `response: Response.t,`,
+            `${(() => { const code = successStatusCodes[0] ?? "200"; const nm = toValidTypeName(`status_${code}_headers`); return `headers: ${nm},`; })()}`,
+            `status: [#${successStatusCodes[0] ?? "200"}],`,
+          ];
+          lines.push(indentLines(`type success = \n{\n${indentLines(fields, 2)}\n}`, 4));
         } else if (successVariants.length > 1) {
-          // If we render variants, also include aux types needed for success payloads
-          if (successAuxTypes.length > 0) {
-            for (const t of successAuxTypes) {
-              lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-            }
-          }
           const body = successVariants.map((v) => `| ${v}`).join("\n  ");
           lines.push(indentLines(`@tag("status")\ntype success =\n  ${body}`, 4));
         } else {
@@ -775,7 +1224,48 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                   for (const [k, v] of entries) { if (k === "application/json") { chosen = v; break; } }
                   if (!chosen && entries.length === 1) chosen = entries[0]![1];
                   if (chosen && typeof chosen === "object" && chosen.schema) {
-                    bodyType = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
+                    // Hoist inline union members for callback request bodies
+                    const auxReq: Array<{ name: string; body: string }> = [];
+                    const base = toValidTypeName(`${mod}_request_body`);
+                    const mapped = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {
+                      parentName: base,
+                      collectAux: (n, b) => auxReq.push({ name: n, body: b }),
+                    });
+                    if (auxReq.length > 0) {
+                      for (const t of auxReq) {
+                        const trimmed = t.body.trimStart();
+                        if (trimmed.startsWith("/**")) {
+                          const idx = trimmed.indexOf("*/");
+                          if (idx >= 0) {
+                            const doc = trimmed.slice(0, idx + 2);
+                            const rest = trimmed.slice(idx + 2).trimStart();
+                            lines.push(indentLines(doc, 4));
+                            lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
+                            continue;
+                          }
+                        }
+                        lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                      }
+                    }
+                    if (/^\s*\{/.test(mapped)) {
+                      const trimmed = mapped.trimStart();
+                      if (trimmed.startsWith("/**")) {
+                        const idx = trimmed.indexOf("*/");
+                        if (idx >= 0) {
+                          const doc = trimmed.slice(0, idx + 2);
+                          const rest = trimmed.slice(idx + 2).trimStart();
+                          lines.push(indentLines(doc, 4));
+                          lines.push(indentLines(`type ${base} = ${rest}`, 4));
+                        } else {
+                          lines.push(indentLines(`type ${base} = ${mapped}`, 4));
+                        }
+                      } else {
+                        lines.push(indentLines(`type ${base} = ${mapped}`, 4));
+                      }
+                      bodyType = base;
+                    } else {
+                      bodyType = mapped;
+                    }
                   } else {
                     bodyType = "JSON.t";
                   }
@@ -794,7 +1284,6 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
               // RESPONSES
               type ResponseLike = { $ref?: string } | any;
               const responses = (cbOp as any)?.responses as Record<string, ResponseLike> | undefined;
-              let singleSuccess: { code: string; ty: string } | undefined;
               const successVariants: string[] = [];
               const successPayloadTypes: string[] = [];
               const successStatusCodes: string[] = [];
@@ -805,6 +1294,7 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
               const addSuccessAuxType = (name: string, body: string) => successAuxTypes.push({ name, body });
               const usedSuccessCtors = new Set<string>();
               const usedErrorCtors = new Set<string>();
+              const headerTypeDefs: Array<{ name: string; body: string }> = [];
               if (responses && typeof responses === "object") {
                 const entries = Object.entries(responses);
                 const bodies: Array<{ code: string; ty: string }> = [];
@@ -816,13 +1306,53 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                     const ents = Object.entries((resp as any).content) as Array<[string, any]>;
                     const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
                     const chosen = chosenEntry?.[1];
-                    if (chosen && chosen.schema) body = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
+                  if (chosen && chosen.schema) {
+                    const base = toValidTypeName(`status_${status}_body`);
+                    body = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {
+                      parentName: base,
+                      collectAux: (n, b) => addSuccessAuxType(n, b),
+                    });
+                  }
                   }
                   const isDefault = status === "default";
                   const n = Number(status);
                   const is2xx = !isNaN(n) && n >= 200 && n < 300;
                   const refNameForCtor = (resp as any)?.$ref ? refName((resp as any).$ref) : undefined;
                   if (is2xx && body) bodies.push({ code: status, ty: body });
+
+                  // Build per-status headers type
+                  const headersVal = (resp as any)?.headers;
+                  const headerTypeName = toValidTypeName(`status_${status === "default" ? "default" : status}_headers`);
+                  if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
+                    let headerBody: string;
+                    if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
+                      const fields: string[] = [];
+                      for (const [hname, hlike] of Object.entries(headersVal)) {
+                        const header = (hlike && typeof hlike === "object" && (hlike as any).$ref) ? ctx.resolve((hlike as any).$ref) : hlike;
+                        let actual: string = "string";
+                        if (header && typeof header === "object") {
+                          if ((header as any).schema) actual = mapSchemaToRes((header as any).schema as SchemaLike, ctx, {});
+                          else if ((header as any).content && typeof (header as any).content === "object") {
+                            const ents = Object.entries((header as any).content) as Array<[string, any]>;
+                            const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
+                            const chosen = chosenEntry?.[1];
+                            if (chosen && chosen.schema) actual = mapSchemaToRes(chosen.schema as SchemaLike, ctx, {});
+                            else actual = "unknown";
+                          }
+                        }
+                        const fn = toValidResFieldName(hname);
+                        if (actual !== "string") {
+                          const doc = wrapBlockDoc(`actual: ${actual}`);
+                          if (doc) fields.push(doc);
+                        }
+                        fields.push(`${fn.attr ?? ""}${fn.rendered}?: string,`);
+                      }
+                      headerBody = `\n{\n${indentLines(fields, 2)}\n}`;
+                    } else {
+                      headerBody = `emptyObject`;
+                    }
+                    headerTypeDefs.push({ name: headerTypeName, body: headerBody });
+                  }
 
                   if (is2xx) {
                     const ctorBase = refNameForCtor ?? "Data";
@@ -832,10 +1362,10 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                     let payload = body ?? "unknown";
                     const isInlineRecord = /^\s*\{/.test(payload);
                     if (isInlineRecord) { const auxName = toValidTypeName(`status_${status}_body`); addSuccessAuxType(auxName, payload); payload = auxName; }
-                    const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: Components.Headers.response})`;
-                    successVariants.push(variant);
-                    successPayloadTypes.push(body ?? "unknown");
-                    successStatusCodes.push(status);
+                    const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
+              successVariants.push(variant);
+              successPayloadTypes.push(payload);
+              successStatusCodes.push(status);
                   } else {
                     let c = refNameForCtor ?? "Error";
                     if (usedErrorCtors.has(c)) { c = isDefault ? `${c}Default` : `${c}S${status}`; let j = 2; while (usedErrorCtors.has(c)) c = `${c}_${j++}`; }
@@ -844,20 +1374,58 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                     const isInlineRecord = /^\s*\{/.test(payload);
                     if (isInlineRecord) { const auxName = toValidTypeName(`status_${isDefault ? "default" : status}_error`); addAuxType(auxName, payload); payload = auxName; }
                     const asAttr = isDefault ? `@as("default") ` : !isNaN(Number(status)) ? `@as(${status}) ` : undefined;
-                    const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: Components.Headers.response})`;
+                    const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
                     errorVariants.push(variant);
                   }
                 }
-                if (bodies.length === 1) singleSuccess = bodies[0];
+                // Always emit variants; do not flatten single-success cases
               }
 
-              if (auxTypes.length > 0) { for (const t of auxTypes) { lines.push(indentLines(`type ${t.name} = ${t.body}`, 4)); } }
-              if (singleSuccess && successVariants.length <= 1) {
-                const statusCtor = `[#${singleSuccess.code}]`;
-                const rec = `{data: ${singleSuccess.ty}, response: Response.t, headers: Components.Headers.response, status: ${statusCtor}}`;
-                lines.push(indentLines(`type success = ${rec}`, 4));
-              } else if (successVariants.length > 1) {
-                if (successAuxTypes.length > 0) { for (const t of successAuxTypes) { lines.push(indentLines(`type ${t.name} = ${t.body}`, 4)); } }
+              // Emit per-status header types
+              if (headerTypeDefs.length > 0) {
+                for (const t of headerTypeDefs) {
+                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                }
+              }
+              if (auxTypes.length > 0) {
+                for (const t of auxTypes) {
+                  const trimmed = t.body.trimStart();
+                  if (trimmed.startsWith("/**")) {
+                    const idx = trimmed.indexOf("*/");
+                    if (idx >= 0) {
+                      const doc = trimmed.slice(0, idx + 2);
+                      const rest = trimmed.slice(idx + 2).trimStart();
+                      lines.push(indentLines(doc, 4));
+                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
+                      continue;
+                    }
+                  }
+                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                }
+              }
+              if (successStatusCodes.length > 0) {
+                const uniq = Array.from(new Set(successStatusCodes));
+                const sorted = uniq.sort((a, b) => Number(a) - Number(b));
+                const pv = sorted.map((s) => `#${s}`).join(" | ");
+                lines.push(indentLines(`type status = [${pv}]`, 4));
+              }
+              if (successAuxTypes.length > 0) {
+                for (const t of successAuxTypes) {
+                  const trimmed = t.body.trimStart();
+                  if (trimmed.startsWith("/**")) {
+                    const idx = trimmed.indexOf("*/");
+                    if (idx >= 0) {
+                      const doc = trimmed.slice(0, idx + 2);
+                      const rest = trimmed.slice(idx + 2).trimStart();
+                      lines.push(indentLines(doc, 4));
+                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
+                      continue;
+                    }
+                  }
+                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                }
+              }
+              if (successVariants.length >= 1) {
                 const body = successVariants.map((v) => `| ${v}`).join("\n  ");
                 lines.push(indentLines(`@tag("status")\ntype success =\n  ${body}`, 4));
               } else {
@@ -947,7 +1515,8 @@ function renderPaths(paths: PathsObject | undefined, ctx: RSContext): { lines: s
 
   let hasClient = false;
   if (clientFields.length > 0) {
-    lines.push(`type client = \n{.\n${indentLines(clientFields, 2)}\n}`);
+    const rows = stripLastComma(clientFields);
+    lines.push(`type client = \n{.\n${indentLines(rows, 2)}\n}`);
     hasClient = true;
   }
   return { lines, hasClient };
@@ -1004,7 +1573,8 @@ function renderWebhooks(webhooks: any, ctx: RSContext): { lines: string[] } {
     clientFields.push(`${JSON.stringify(he.name)}: ${toValidTypeName(`${he.name}_webhook`)},`);
   }
   if (clientFields.length > 0) {
-    lines.push(`type webhooks = \n{.\n${indentLines(clientFields, 2)}\n}`);
+    const rows = stripLastComma(clientFields);
+    lines.push(`type webhooks = \n{.\n${indentLines(rows, 2)}\n}`);
   }
   return { lines };
 }
@@ -1073,7 +1643,8 @@ function renderCallbacks(paths: PathsObject | undefined, ctx: RSContext): { line
     clientFields.push(`${JSON.stringify(ent.opId)}: ${tn},`);
   }
   if (clientFields.length > 0) {
-    lines.push(`type callbacks = \n{.\n${indentLines(clientFields, 2)}\n}`);
+    const rows = stripLastComma(clientFields);
+    lines.push(`type callbacks = \n{.\n${indentLines(rows, 2)}\n}`);
   }
   return { lines };
 }

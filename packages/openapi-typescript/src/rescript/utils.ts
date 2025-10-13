@@ -91,7 +91,9 @@ export function wrapBlockDoc(s?: string): string | undefined {
   if (!s) return undefined;
   const body = s.trim();
   if (!body) return undefined;
-  return ["/**", ...body.split("\n").map((l) => ` * ${l}`), " */"].join("\n");
+  // Sanitize nested comment sentinels to keep formatter/parser happy on large contexts
+  const safe = body.replace(/\*\//g, "* /").replace(/\/\*/g, "/ *");
+  return ["/**", ...safe.split("\n").map((l) => ` * ${l}`), " */"].join("\n");
 }
 
 export function refName($ref: string): string | undefined {
