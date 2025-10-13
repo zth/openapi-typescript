@@ -102,3 +102,42 @@ export default async function openapiTS(
 
   return result;
 }
+
+// ReScript emitter (experimental): Convert an OpenAPI schema directly to a ReScript string
+export async function openapiRS(
+  source: string | URL | OpenAPI3 | Buffer | Readable,
+  options: OpenAPITSOptions = {} as Partial<OpenAPITSOptions>,
+): Promise<string> {
+  if (!source) {
+    throw new Error("Empty schema. Please specify a URL, file path, or Redocly Config");
+  }
+
+  const redoc =
+    options.redocly ??
+    (await createConfig(
+      {
+        rules: {
+          "operation-operationId-unique": { severity: "error" },
+        },
+      },
+      { extends: ["minimal"] },
+    ));
+
+  const schema = await validateAndBundle(source, {
+    redoc,
+    cwd: options.cwd instanceof URL ? options.cwd : new URL(`file://${options.cwd ?? process.cwd()}/`),
+    silent: options.silent ?? false,
+  });
+
+  const ctx = {
+    alphabetize: options.alphabetize ?? false,
+    excludeDeprecated: options.excludeDeprecated ?? false,
+    silent: options.silent ?? false,
+    resolve($ref: string) {
+      return resolveRef(schema, $ref, { silent: options.silent ?? false });
+    },
+  } as const;
+
+  const { emitReScript } = await import("./rescript/index.js");
+  return emitReScript(schema, ctx);
+}
