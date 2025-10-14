@@ -31,6 +31,62 @@ function shortHash(s: string): string {
   return h.toString(16).slice(0, 6);
 }
 
+// Strip a leading doc block (/** ... */) if present to simplify pattern checks
+function stripLeadingDoc(s: string): string {
+  const t = s.trimStart();
+  if (t.startsWith("/**")) {
+    const i = t.indexOf("*/");
+    if (i >= 0) return t.slice(i + 2).trimStart();
+  }
+  return t;
+}
+
+// Hoist inline record literals that appear inside wrappers like Null.t< { .. } >, array<{..}>, dict<{..}>
+// This centralizes detection to minimize scattered regex heuristics. It relies on content-hash-based
+// aux naming for stability.
+function hoistInlineRecordsInWrappers(
+  ty: string,
+  collectAux: ((name: string, body: string) => void) | undefined,
+  parentName?: string,
+): string {
+  if (typeof collectAux !== "function") return ty;
+  let out = ty;
+  let changed = true;
+  const mkName = (body: string, baseHint?: string): string => {
+    const base = toValidTypeName(`${parentName ?? "t"}_${baseHint ?? "shape"}`);
+    return nameWithHash(base, body);
+  };
+  const replaceOnce = (s: string): { s: string; changed: boolean } => {
+    let t = s;
+    const tryReplace = (pattern: RegExp, make: (recBody: string) => string): boolean => {
+      const m = stripLeadingDoc(t).match(pattern);
+      if (!m) return false;
+      const rec = m[1]!;
+      const aux = mkName(rec);
+      collectAux(aux, rec);
+      t = t.replace(pattern, make(rec).replace(rec, aux));
+      return true;
+    };
+    // 1) Null.t<{...}>
+    if (tryReplace(/^Null\.t<\s*(\{[\s\S]*\})\s*>\s*$/, (rec) => `Null.t<${rec}>`)) return { s: t, changed: true };
+    // 2) array<{...}>
+    if (tryReplace(/^array<\s*(\{[\s\S]*\})\s*>\s*$/, (rec) => `array<${rec}>`)) return { s: t, changed: true };
+    // 3) dict<{...}>
+    if (tryReplace(/^dict<\s*(\{[\s\S]*\})\s*>\s*$/, (rec) => `dict<${rec}>`)) return { s: t, changed: true };
+    // 4) array<Null.t<{...}>> (nesting)
+    if (tryReplace(/^array<\s*Null\.t<\s*(\{[\s\S]*\})\s*>\s*>\s*$/, (rec) => `array<Null.t<${rec}>>`)) return { s: t, changed: true };
+    // 5) dict<Null.t<{...}>> (nesting)
+    if (tryReplace(/^dict<\s*Null\.t<\s*(\{[\s\S]*\})\s*>\s*>\s*$/, (rec) => `dict<Null.t<${rec}>>`)) return { s: t, changed: true };
+    return { s: t, changed: false };
+  };
+  while (changed) {
+    const res = replaceOnce(out.trim());
+    out = res.s;
+    changed = res.changed;
+  }
+  return out;
+}
+
 function nameWithHash(base: string, body: string): string {
   let content = body.trimStart();
   if (content.startsWith("/**")) {
@@ -121,13 +177,15 @@ function mapSchemaToRes(
     const others = arr.filter((t) => t !== "null");
     if (hasNull && others.length === 1) {
       const tmp: any = { ...(schema as any), type: others[0] };
-      const inner = mapSchemaToRes(tmp as any, ctx, { parentName, collectAux, optionalAsOption });
+      let inner = mapSchemaToRes(tmp as any, ctx, { parentName, collectAux, optionalAsOption });
+      inner = hoistInlineRecordsInWrappers(inner, collectAux, parentName);
       return `Null.t<${inner}>`;
     }
   }
   const prim = mapPrimitive(schema as any);
   if (prim) {
-    return (schema as any).nullable ? `Null.t<${prim}>` : prim;
+    const base = (schema as any).nullable ? `Null.t<${prim}>` : prim;
+    return hoistInlineRecordsInWrappers(base, collectAux, parentName);
   }
 
   // arrays
@@ -140,25 +198,18 @@ function mapSchemaToRes(
       collectAux(nm, inner);
       inner = nm;
     }
-    const arr = `array<${inner}>`;
+    let arr = `array<${inner}>`;
+    arr = hoistInlineRecordsInWrappers(arr, collectAux, parentName);
     return schema.nullable ? `Null.t<${arr}>` : arr;
   }
 
   // composition: oneOf / anyOf → PV union wrapped in Wrapped.t when possible
   const unionMembers = (schema as any).oneOf ?? (schema as any).anyOf;
   if (Array.isArray(unionMembers) && unionMembers.length > 0) {
-    const stripLeadingDoc = (s: string): string => {
-      const t = s.trimStart();
-      if (t.startsWith("/**")) {
-        const i = t.indexOf("*/");
-        if (i >= 0) return t.slice(i + 2).trimStart();
-      }
-      return t;
-    };
     const isInlineRecordLike = (s: string): boolean => {
       const t = stripLeadingDoc(s);
       const patterns = [
-        /^\{/,
+        /^\{/, 
         /^Null\.t<\s*\{/,
         /^array<\s*\{/,
         /^dict<\s*\{/,
@@ -342,7 +393,8 @@ function mapSchemaToRes(
         collectAux(nm, inner);
         inner = nm;
       }
-      const dict = `dict<${inner}>`;
+      let dict = `dict<${inner}>`;
+      dict = hoistInlineRecordsInWrappers(dict, collectAux, parentName);
       return schema.nullable ? `Null.t<${dict}>` : dict;
     }
 
@@ -355,6 +407,16 @@ function mapSchemaToRes(
         const auxName = nameWithHash(propBase, mapped);
         collectAux(auxName, mapped);
         mapped = auxName;
+      } else if (/^\s*Null\.t<\s*\{/.test(mapped) && typeof collectAux === "function") {
+        // Also hoist when a nullable inline record appears inside Null.t< {...} >
+        const m = mapped.match(/^\s*Null\.t<\s*(\{[\s\S]*\})\s*>\s*$/);
+        if (m) {
+          const baseParent = parentName ?? "t";
+          const propBase = toValidTypeName(`${baseParent}_${propName}`);
+          const auxName = nameWithHash(propBase, m[1]!);
+          collectAux(auxName, m[1]!);
+          mapped = `Null.t<${auxName}>`;
+        }
       }
       const isReq = required.has(propName);
       const { rendered, attr } = toValidResFieldName(propName);
@@ -603,6 +665,13 @@ function mapSchemaToRes(
           const auxName = toValidTypeName(`${parentName ?? "t"}_${String(propName)}`);
           collectAux(auxName, mapped);
           mapped = auxName;
+        } else if (/^\s*Null\.t<\s*\{/.test(mapped) && typeof collectAux === "function") {
+          const m = mapped.match(/^\s*Null\.t<\s*(\{[\s\S]*\})\s*>\s*$/);
+          if (m) {
+            const auxName = toValidTypeName(`${parentName ?? "t"}_${String(propName)}`);
+            collectAux(auxName, m[1]!);
+            mapped = `Null.t<${auxName}>`;
+          }
         }
         const isReq = required.has(propName);
         const { rendered, attr } = toValidResFieldName(propName);
@@ -716,6 +785,8 @@ function renderComponentsSchemas(components: ComponentsObject | undefined, ctx: 
         collectAux: (n, b) => aux.push({ name: n, body: b }),
         optionalAsOption: true,
       });
+      // Final guard: ensure no inline record is left inside wrappers at the top level
+      body = hoistInlineRecordsInWrappers(body, (n, b) => aux.push({ name: n, body: b }), typeName);
       if (body.trim() === "unknown") {
         const extra = wrapBlockDoc("TODO: unsupported or ambiguous schema; fell back to unknown");
         if (extra) topDoc = topDoc ? `${topDoc}\n${extra.replace(/^\/\*\*|\*\/$/g, '').trim()}` : extra.replace(/^\/\*\*|\*\/$/g, '').trim();
@@ -1577,6 +1648,7 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                   lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
                 }
               }
+              // Emit error aux types
               if (auxTypes.length > 0) {
                 for (const t of auxTypes) {
                   const trimmed = t.body.trimStart();
@@ -1593,6 +1665,7 @@ function renderOperations(paths: PathsObject | undefined, webhooks: any, ctx: RS
                   lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
                 }
               }
+              // per-operation status alias (success 2xx codes)
               if (successStatusCodes.length > 0) {
                 const uniq = Array.from(new Set(successStatusCodes));
                 const sorted = uniq.sort((a, b) => Number(a) - Number(b));
