@@ -49,6 +49,7 @@
     "lint": "pnpm run lint:js && pnpm run lint:ts",
     "lint:js": "biome check .",
     "lint:ts": "tsc --noEmit",
+    "compare:rescript": "vite-node ./scripts/compare-rescript.ts",
     "prepack": "pnpm run build",
     "test": "pnpm run test:js && pnpm run test:examples && pnpm run test:exports",
     "test:js": "vitest run",

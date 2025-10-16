@@ -28,6 +28,9 @@ import {
   toValidTypeName,
   wrapBlockDoc,
 } from "./utils.js";
+import type { RSNode, TypeIR } from "./ir.js";
+import { raw as rawIR, withDoc } from "./ir.js";
+import { printFile } from "./printer.js";
 
 function hasDefs(s: SchemaObject): s is SchemaObject & { $defs: $defs } {
   return "$defs" in s && s.$defs != null && typeof s.$defs === "object";
@@ -162,6 +165,23 @@ function nameWithHash(base: string, body: string): string {
   const h = shortHash(content);
   return `${base}__h${h}`;
 }
+
+type TypeDeclIR = { name: string; body: TypeIR };
+
+function splitDocBlock(body: string): { doc?: string; code: string } {
+  const t = body.trimStart();
+  if (t.startsWith("/**")) {
+    const i = t.indexOf("*/");
+    if (i >= 0) {
+      const doc = t.slice(0, i + 2);
+      const code = t.slice(i + 2).trimStart();
+      return { doc, code };
+    }
+  }
+  return { code: body };
+}
+
+// (removed) legacy local printers; all code now builds RS IR and is printed by printer.ts
 
 function mapSchemaToRes(
   schema: SchemaLike,
@@ -547,7 +567,7 @@ function mapSchemaToRes(
   // (enum mapping handled above)
 
   // objects with properties
-  if (isObjectSchema(s)) {
+  if (s.type === "object" || ("properties" in s && s.properties)) {
     const required = new Set<string>(s.required ?? []);
     let props: Record<string, SchemaLike> = {};
     if ("properties" in s && s.properties) props = s.properties;
@@ -1062,13 +1082,11 @@ function mapSchemaToRes(
   return "unknown";
 }
 
-function renderComponentsSchemas(
+function buildComponentsSchemas(
   components: ComponentsObject | undefined,
   ctx: RSContext
-): string[] {
-  const lines: string[] = [];
-  lines.push("module Components = {");
-  lines.push(indentLines("module Schemas = {", 2));
+): RSNode {
+  const schemasItems: RSNode[] = [];
 
   const schemas = components?.schemas ?? {};
   const entries = getEntries(schemas, {
@@ -1076,10 +1094,10 @@ function renderComponentsSchemas(
     excludeDeprecated: ctx.excludeDeprecated,
   });
   if (entries.length > 0) {
-    const decls: string[] = [];
+    const declNodes: RSNode[] = [];
     entries.forEach(([name, schema], idx) => {
       const typeName = toValidTypeName(name);
-      const aux: Array<{ name: string; body: string }> = [];
+      const aux: Array<TypeDeclIR> = [];
       // Compose doc: include description + array constraints if present
       let topDoc = schema.description ?? undefined;
       const sObj = schema;
@@ -1117,15 +1135,13 @@ function renderComponentsSchemas(
       }
       let body = mapSchemaToRes(schema, ctx, {
         parentName: typeName,
-        collectAux: (n, b) => aux.push({ name: n, body: b }),
+        collectAux: (n, b) => {
+          const { doc, code } = splitDocBlock(b);
+          aux.push({ name: n, body: withDoc(doc, rawIR(code)) });
+        },
         optionalAsOption: true,
       });
-      // Final guard: ensure no inline record is left inside wrappers at the top level
-      body = hoistInlineRecordsInWrappers(
-        body,
-        (n, b) => aux.push({ name: n, body: b }),
-        typeName
-      );
+      // Note: Final guard removed; hoisting must happen during traversal (stage 1)
       if (body.trim() === "unknown") {
         const extra = wrapBlockDoc(
           "TODO: unsupported or ambiguous schema; fell back to unknown"
@@ -1136,35 +1152,23 @@ function renderComponentsSchemas(
             : extra.replace(/^\/\*\*|\*\/$/g, "").trim();
       }
       const doc = wrapBlockDoc(topDoc);
-      const kw = idx === 0 ? "type rec" : "and";
-      const decl = `${doc ? doc + "\n" : ""}${kw} ${typeName} = ${body}`;
-      decls.push(decl);
+      const kw: "type rec" | "and" = idx === 0 ? "type rec" : "and";
+      const firstBody: TypeIR = withDoc(doc, rawIR(body));
+      declNodes.push({ kind: "type", keyword: kw, name: typeName, body: firstBody });
       if (aux.length > 0) {
         const seen = new Set<string>();
         for (const t of aux) {
           if (seen.has(t.name)) continue;
-          // If body starts with a doc block, lift it before the type declaration
-          if (t.body.trimStart().startsWith("/**")) {
-            const idx = t.body.indexOf("*/");
-            if (idx >= 0) {
-              const doc = t.body.slice(0, idx + 2);
-              const rest = t.body.slice(idx + 2).trimStart();
-              decls.push(`${doc}\nand ${t.name} = ${rest}`);
-              seen.add(t.name);
-              continue;
-            }
-          }
-          decls.push(`and ${t.name} = ${t.body}`);
+          declNodes.push({ kind: "type", keyword: "and", name: t.name, body: t.body });
           seen.add(t.name);
         }
       }
     });
-    lines.push(indentLines(decls.join("\n"), 4));
+    schemasItems.push(...declNodes);
   }
 
-  lines.push(indentLines("}", 2));
   // Headers aggregator submodule
-  lines.push(indentLines("module Headers = {", 2));
+  const headersItems: RSNode[] = [];
   const hdrs = components?.headers ?? {};
   const hdrEntries = Object.entries(hdrs);
   if (hdrEntries.length > 0) {
@@ -1198,35 +1202,39 @@ function renderComponentsSchemas(
       }
       fields.push(field);
     }
-    lines.push(
-      indentLines(`type response = \n{\n${indentLines(fields, 2)}\n}`, 4)
-    );
+    const bodyIR = rawIR(`\n{\n${indentLines(fields, 2)}\n}`);
+    headersItems.push({ kind: "type", keyword: "type", name: "response", body: bodyIR });
   } else {
-    lines.push(indentLines(`type response = emptyObject`, 4));
+    headersItems.push({ kind: "type", keyword: "type", name: "response", body: rawIR("emptyObject") });
   }
-  lines.push(indentLines("}", 2));
-  lines.push("}");
-  return lines;
+  const componentsNode: RSNode = {
+    kind: "module",
+    name: "Components",
+    items: [
+      { kind: "module", name: "Schemas", items: schemasItems },
+      { kind: "module", name: "Headers", items: headersItems },
+    ],
+  };
+  return componentsNode;
 }
 
 export function emitReScript(schema: OpenAPI3, ctx: RSContext): string {
-  const out: string[] = [];
-  // Use the same header format; it’s valid ReScript doc comment
-  out.push(COMMENT_HEADER.trimEnd());
-  // Silence selected warnings from generated code
-  out.push('@@warning("-30")');
-  // Bring OpenAPIFetch helpers (emptyObject, Wrapped, etc.) into scope
-  out.push("open OpenAPIFetch\n");
+  const file: RSNode[] = [];
+  // header doc
+  file.push({ kind: "comment", code: COMMENT_HEADER.trimEnd() });
+  // global attrs and opens
+  file.push({ kind: "attr", code: '@@warning("-30")' });
+  file.push({ kind: "open", name: "OpenAPIFetch" });
+  file.push({ kind: "blank" });
 
-  // Start with Components.Schemas only (Phase 0)
-  out.push(...renderComponentsSchemas(schema.components, ctx));
+  // Components
+  file.push(buildComponentsSchemas(schema.components, ctx));
+  // Operations (now via IR)
+  file.push(buildOperations(schema.paths, schema.webhooks, ctx));
 
-  // Minimal Operations emission (modules only with placeholders)
-  out.push(...renderOperations(schema.paths, schema.webhooks, ctx));
-
-  // Paths & Client types
-  const { lines: pathLines, hasClient } = renderPaths(schema.paths, ctx);
-  out.push(...pathLines);
+  // Paths & Client types (now via IR)
+  const { nodes: pathNodes, hasClient } = buildPaths(schema.paths, ctx);
+  if (pathNodes.length > 0) file.push(...pathNodes);
   if (hasClient) {
     const clientDoc = wrapBlockDoc(
       [
@@ -1240,25 +1248,30 @@ export function emitReScript(schema: OpenAPI3, ctx: RSContext): string {
         "- Security requirements in the schema are informational; types don't enforce auth.",
       ].join("\n")
     );
-    if (clientDoc) out.push("", clientDoc);
-    out.push(
-      '@module("openapi-fetch")',
-      'external createClient: createClientOptions => Client.clientContainer<client> = "createClient"',
-      "",
-      "let createClient = options => createFetchClient(createClient(options))",
-      ""
-    );
+    if (clientDoc) file.push({ kind: "raw", code: "\n" + clientDoc });
+    file.push({ kind: "attr", code: '@module("openapi-fetch")' });
+    file.push({
+      kind: "raw",
+      code:
+        'external createClient: createClientOptions => Client.clientContainer<client> = "createClient"',
+    });
+    file.push({ kind: "blank" });
+    file.push({
+      kind: "raw",
+      code: "let createClient = options => createFetchClient(createClient(options))",
+    });
+    file.push({ kind: "blank" });
   }
 
-  // Webhooks types
-  const { lines: webhookLines } = renderWebhooks(schema.webhooks, ctx);
-  out.push(...webhookLines);
+  // Webhooks types (now via IR)
+  const { nodes: webhookNodes } = buildWebhooks(schema.webhooks, ctx);
+  if (webhookNodes.length > 0) file.push(...webhookNodes);
 
-  // Callbacks types
-  const { lines: callbackLines } = renderCallbacks(schema.paths, ctx);
-  out.push(...callbackLines);
+  // Callbacks types (now via IR)
+  const { nodes: callbackNodes } = buildCallbacks(schema.paths, ctx);
+  if (callbackNodes.length > 0) file.push(...callbackNodes);
 
-  return out.join("\n") + "\n";
+  return printFile(file);
 }
 
 function resolveOperation(
@@ -1272,44 +1285,41 @@ function resolveOperation(
   return op;
 }
 
-function renderOperations(
+function buildOperations(
   paths: PathsObject | undefined,
   webhooks: OpenAPI3["webhooks"] | undefined,
   ctx: RSContext
-): string[] {
-  const lines: string[] = [];
-  lines.push("module Operations = {");
+): RSNode {
+  const opsItems: RSNode[] = [];
   // Bring component schema types into scope for operation payloads
-  lines.push(indentLines("open Components.Schemas", 2));
+  opsItems.push({ kind: "open", name: "Components.Schemas" });
 
-  function emitForContainer(
+  const METHODS: (keyof PathItemObject)[] = [
+    "get",
+    "put",
+    "post",
+    "delete",
+    "options",
+    "head",
+    "patch",
+    "trace",
+  ];
+
+  const emitForContainer = (
     container?: Record<string, PathItemObject | ReferenceObject> | undefined
-  ) {
+  ) => {
     if (!container) return;
-    const METHODS: (keyof PathItemObject)[] = [
-      "get",
-      "put",
-      "post",
-      "delete",
-      "options",
-      "head",
-      "patch",
-      "trace",
-    ];
     for (const [p, item] of Object.entries(container)) {
       for (const m of METHODS) {
         const op = isRef(item) ? undefined : resolveOperation(item[m], ctx);
         if (!op) continue;
         const opId = op.operationId;
-        let opName: string | undefined = undefined;
-        if (opId && opId.length > 0) opName = opId;
-        else opName = `${String(p)}_${String(m)}`;
+        const opName = opId && opId.length > 0 ? opId : `${String(p)}_${String(m)}`;
         const mod = toValidModuleName(opName);
-        lines.push(indentLines(`module ${mod} = {`, 2));
-        // Security requirements doc (if any)
-        const secReq = op.security as
-          | Array<Record<string, string[]>>
-          | undefined;
+        const modItems: RSNode[] = [];
+
+        // Security requirements doc
+        const secReq = op.security as Array<Record<string, string[]>> | undefined;
         if (Array.isArray(secReq) && secReq.length > 0) {
           const parts: string[] = [];
           for (const req of secReq) {
@@ -1318,35 +1328,25 @@ function renderOperations(
               parts.push(`${scheme}${list}`);
             }
           }
-          const doc = wrapBlockDoc(
-            parts.length > 0 ? `security: ${parts.join("; ")}` : undefined
-          );
-          if (doc) lines.push(indentLines(doc, 4));
+          const doc = wrapBlockDoc(parts.length > 0 ? `security: ${parts.join("; ")}` : undefined);
+          if (doc) modItems.push({ kind: "raw", code: doc });
         }
-        // PARAMETERS: collect from path-level + op-level
-        const allParams: Array<
-          import("../types.js").ParameterObject | ReferenceObject
-        > = [];
+
+        // PARAMETERS
+        const allParams: Array<import("../types.js").ParameterObject | ReferenceObject> = [];
         const pathParams = isRef(item) ? undefined : item.parameters;
         if (Array.isArray(pathParams)) allParams.push(...pathParams);
-        const opParams = op.parameters as
-          | (import("../types.js").ParameterObject | ReferenceObject)[]
-          | undefined;
+        const opParams = op.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
         if (Array.isArray(opParams)) allParams.push(...opParams);
 
         type GroupKey = "query" | "header" | "path" | "cookie";
-        const groups: Record<GroupKey, string[]> = {
-          query: [],
-          header: [],
-          path: [],
-          cookie: [],
-        };
-        const paramAux: Array<{ name: string; body: string }> = [];
+        const groups: Record<GroupKey, string[]> = { query: [], header: [], path: [], cookie: [] };
+        const paramAux: Array<TypeDeclIR> = [];
         const present: Set<GroupKey> = new Set();
-        for (const p of allParams) {
-          const param = isRef(p)
-            ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref)
-            : p;
+        for (const pp of allParams) {
+          const param = isRef(pp)
+            ? ctx.resolve<import("../types.js").ParameterObject>(pp.$ref)
+            : pp;
           if (!param) continue;
           const where = param.in;
           const name = param.name;
@@ -1355,43 +1355,29 @@ function renderOperations(
           const schema = param.schema;
           let ty = "unknown";
           if (schema) {
-            const base = toValidTypeName(
-              `${mod}_${where}_${toValidTypeName(name)}`
-            );
+            const base = toValidTypeName(`${mod}_${where}_${toValidTypeName(name)}`);
             ty = mapSchemaToRes(schema, ctx, {
               parentName: base,
-              collectAux: (n, b) => paramAux.push({ name: n, body: b }),
+              collectAux: (n, b) => {
+                const { doc, code } = splitDocBlock(b);
+                paramAux.push({ name: n, body: withDoc(doc, rawIR(code)) });
+              },
             });
           }
           const fname = toValidResFieldName(name);
           const sep = required ? ": " : "?: ";
           const pdoc = wrapBlockDoc(param.description);
           if (pdoc) groups[where].push(pdoc);
-          groups[where].push(
-            `${fname.attr ?? ""}${fname.rendered}${sep}${ty},`
-          );
+          groups[where].push(`${fname.attr ?? ""}${fname.rendered}${sep}${ty},`);
           present.add(where);
         }
 
-        const paramTypeDecls: string[] = [];
         const fieldOrder: GroupKey[] = ["query", "header", "path", "cookie"];
         if (paramAux.length > 0) {
           const seenParamAux = new Set<string>();
           for (const t of paramAux) {
             if (seenParamAux.has(t.name)) continue;
-            const trimmed = t.body.trimStart();
-            if (trimmed.startsWith("/**")) {
-              const idx = trimmed.indexOf("*/");
-              if (idx >= 0) {
-                const doc = trimmed.slice(0, idx + 2);
-                const rest = trimmed.slice(idx + 2).trimStart();
-                lines.push(indentLines(doc, 4));
-                lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
-                seenParamAux.add(t.name);
-                continue;
-              }
-            }
-            lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+            modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
             seenParamAux.add(t.name);
           }
         }
@@ -1399,7 +1385,7 @@ function renderOperations(
           if (!present.has(k)) continue;
           const body = groups[k];
           const typeBody = `\n{\n${indentLines(body, 2)}\n}`;
-          lines.push(indentLines(`type ${k} = ${typeBody}`, 4));
+          modItems.push({ kind: "type", keyword: "type", name: k, body: rawIR(typeBody) });
         }
         if (present.size > 0) {
           const paramsFields: string[] = [];
@@ -1408,23 +1394,19 @@ function renderOperations(
             const target = toValidResFieldName(k);
             paramsFields.push(`${target.attr ?? ""}${target.rendered}?: ${k},`);
           }
-          lines.push(
-            indentLines(
-              `type params = \n{\n${indentLines(paramsFields, 2)}\n}`,
-              4
-            )
-          );
+          const paramsBody = rawIR(`\n{\n${indentLines(paramsFields, 2)}\n}`);
+          modItems.push({ kind: "type", keyword: "type", name: "params", body: paramsBody });
         }
 
-        // REQUEST BODY: prefer application/json schema
-        let bodyType: string | undefined = undefined;
+        // REQUEST BODY
+        let bodyType: string | undefined;
         const rb = op.requestBody;
         if (rb) {
           const req = isRef(rb) ? ctx.resolve<RequestBodyObject>(rb.$ref) : rb;
-          const content = req ? req.content : undefined;
+          const content = req && req.content && typeof req.content === "object" ? req.content : undefined;
           if (content) {
             const entries = Object.entries(content);
-            let chosen: MediaTypeObject | ReferenceObject | undefined;
+            let chosen: MediaTypeObject | ReferenceObject | undefined = undefined;
             for (const [k, v] of entries) {
               if (k === "application/json") {
                 chosen = v;
@@ -1432,120 +1414,76 @@ function renderOperations(
               }
             }
             if (!chosen && entries.length === 1) chosen = entries[0]![1];
-            const chosenResolved =
-              chosen && isRef(chosen)
-                ? ctx.resolve<MediaTypeObject>(chosen.$ref)
-                : chosen;
+            const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
             if (chosenResolved && chosenResolved.schema) {
-              // Pass a parentName + collector so inline union members get hoisted to aux types
-              const aux: Array<{ name: string; body: string }> = [];
+              const aux: Array<TypeDeclIR> = [];
               const base = toValidTypeName(`${mod}_request_body`);
               const mapped = mapSchemaToRes(chosenResolved.schema, ctx, {
                 parentName: base,
-                collectAux: (n, b) => aux.push({ name: n, body: b }),
+                collectAux: (n, b) => {
+                  const { doc, code } = splitDocBlock(b);
+                  aux.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                },
               });
               if (aux.length > 0) {
                 const seenReqAux = new Set<string>();
                 for (const t of aux) {
                   if (seenReqAux.has(t.name)) continue;
-                  const trimmed = t.body.trimStart();
-                  if (trimmed.startsWith("/**")) {
-                    const idx = trimmed.indexOf("*/");
-                    if (idx >= 0) {
-                      const doc = trimmed.slice(0, idx + 2);
-                      const rest = trimmed.slice(idx + 2).trimStart();
-                      lines.push(indentLines(doc, 4));
-                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
-                      seenReqAux.add(t.name);
-                      continue;
-                    }
-                  }
-                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
+                  modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
                   seenReqAux.add(t.name);
                 }
               }
-              // Never inline record types directly in field positions; use a named aux type
               if (/^\s*\{/.test(mapped)) {
-                const trimmed = mapped.trimStart();
-                if (trimmed.startsWith("/**")) {
-                  const idx = trimmed.indexOf("*/");
-                  if (idx >= 0) {
-                    const doc = trimmed.slice(0, idx + 2);
-                    const rest = trimmed.slice(idx + 2).trimStart();
-                    lines.push(indentLines(doc, 4));
-                    lines.push(indentLines(`type ${base} = ${rest}`, 4));
-                  } else {
-                    lines.push(indentLines(`type ${base} = ${mapped}`, 4));
-                  }
-                } else {
-                  lines.push(indentLines(`type ${base} = ${mapped}`, 4));
-                }
+                const { doc: bdoc, code: bcode } = splitDocBlock(mapped);
+                modItems.push({ kind: "type", keyword: "type", name: base, body: withDoc(bdoc, rawIR(bcode)) });
                 bodyType = base;
               } else {
                 bodyType = mapped;
               }
             } else {
-              // if we can't detect a schema, default to JSON.t to signal presence of a body
               bodyType = "JSON.t";
             }
           }
         }
 
-        // Minimal placeholders for now; parameters wrapper when needed
+        // PARAMETERS wrapper
         const parametersFields: string[] = [];
         if (present.size > 0) parametersFields.push("params?: params,");
         if (bodyType) parametersFields.push(`body?: ${bodyType},`);
         if (parametersFields.length > 0) {
-          lines.push(
-            indentLines(
-              `type parameters = \n{\n${indentLines(parametersFields, 2)}\n}`,
-              4
-            )
-          );
+          const pBody = rawIR(`\n{\n${indentLines(parametersFields, 2)}\n}`);
+          modItems.push({ kind: "type", keyword: "type", name: "parameters", body: pBody });
         } else {
-          lines.push(indentLines(`type parameters = emptyObject`, 4));
+          modItems.push({ kind: "type", keyword: "type", name: "parameters", body: rawIR("emptyObject") });
         }
-        // RESPONSES: status-tagged variants for multi-2xx and non-2xx/default
+
+        // RESPONSES
         const responses = op.responses;
-        let singleSuccess: { code: string; ty: string } | undefined;
         const successVariants: string[] = [];
         const successPayloadTypes: string[] = [];
         const successStatusCodes: string[] = [];
         const errorVariants: string[] = [];
         const usedSuccessCtors: Set<string> = new Set();
         const usedErrorCtors: Set<string> = new Set();
-        const auxTypes: { name: string; body: string }[] = [];
+        const auxTypes: TypeDeclIR[] = [];
+        const successAuxTypes: TypeDeclIR[] = [];
+        const headerTypeDefs: TypeDeclIR[] = [];
+
         const addAuxType = (name: string, body: string) => {
-          if (!auxTypes.some((t) => t.name === name))
-            auxTypes.push({ name, body });
-        };
-        const successAuxTypes: { name: string; body: string }[] = [];
-        const addSuccessAuxType = (name: string, body: string) => {
-          if (!successAuxTypes.some((t) => t.name === name))
-            successAuxTypes.push({ name, body });
-        };
-        const headerTypeDefs: { name: string; body: string }[] = [];
-        const emitTypeWithDoc = (
-          indent: number,
-          name: string,
-          body: string
-        ) => {
-          const trimmed = body.trimStart();
-          if (trimmed.startsWith("/**")) {
-            const idx = trimmed.indexOf("*/");
-            if (idx >= 0) {
-              const doc = trimmed.slice(0, idx + 2);
-              const rest = trimmed.slice(idx + 2).trimStart();
-              lines.push(indentLines(doc, indent));
-              lines.push(indentLines(`type ${name} = ${rest}`, indent));
-              return;
-            }
+          if (!auxTypes.some((t) => t.name === name)) {
+            const { doc, code } = splitDocBlock(body);
+            auxTypes.push({ name, body: withDoc(doc, rawIR(code)) });
           }
-          lines.push(indentLines(`type ${name} = ${body}`, indent));
+        };
+        const addSuccessAuxType = (name: string, body: string) => {
+          if (!successAuxTypes.some((t) => t.name === name)) {
+            const { doc, code } = splitDocBlock(body);
+            successAuxTypes.push({ name, body: withDoc(doc, rawIR(code)) });
+          }
         };
 
         if (responses && typeof responses === "object") {
-          // Collect success bodies for flattening case as well
+          // Collect success bodies
           const bodies: { code: string; ty: string }[] = [];
           for (const [status, respLike] of Object.entries(responses)) {
             const isDefault = status === "default";
@@ -1558,14 +1496,8 @@ function renderOperations(
               }
               return undefined;
             })();
-
-            const resolved = isRef(respLike)
-              ? ctx.resolve<ResponseObject>(respLike.$ref)
-              : respLike;
-            const content =
-              resolved && typeof resolved === "object"
-                ? resolved.content
-                : undefined;
+            const resolved = isRef(respLike) ? ctx.resolve<ResponseObject>(respLike.$ref) : respLike;
+            const content = resolved && typeof resolved === "object" ? resolved.content : undefined;
             let body: string | undefined;
             let unknownReason: string | undefined;
             let noContent: boolean = false;
@@ -1580,42 +1512,29 @@ function renderOperations(
               }
               if (!chosen && entries.length === 1) chosen = entries[0]![1];
               if (chosen && chosen.schema) {
-                // For response bodies, pass a parentName + collector to hoist inline union members
                 const base = toValidTypeName(`status_${status}_body`);
-                const auxLocal: Array<{ name: string; body: string }> = [];
                 body = mapSchemaToRes(chosen.schema, ctx, {
                   parentName: base,
                   collectAux: (n, b) => addSuccessAuxType(n, b),
                   optionalAsOption: true,
                 });
               } else {
-                // No schema for chosen media type
                 body = "unknown";
                 unknownReason = "no schema for chosen media type";
               }
             } else {
-              // No content for this response status (e.g., 204) or unspecified
               body = "unit";
               noContent = true;
             }
 
             if (is2xx) bodies.push({ code: status, ty: body ?? "unknown" });
 
-            // Build per-status headers type
-            const headersVal =
-              resolved && typeof resolved === "object"
-                ? resolved.headers
-                : undefined;
-            const headerTypeName = toValidTypeName(
-              `status_${isDefault ? "default" : status}_headers`
-            );
+            // Per-status headers
+            const headersVal = resolved && typeof resolved === "object" ? resolved.headers : undefined;
+            const headerTypeName = toValidTypeName(`status_${isDefault ? "default" : status}_headers`);
             if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
               let headerBody: string;
-              if (
-                headersVal &&
-                typeof headersVal === "object" &&
-                Object.keys(headersVal).length > 0
-              ) {
+              if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
                 const fields: string[] = [];
                 for (const [hname, hlike] of Object.entries(headersVal)) {
                   const header: HeaderObject | undefined = isRef(hlike)
@@ -1625,20 +1544,12 @@ function renderOperations(
                   if (header && typeof header === "object") {
                     if (header.schema) {
                       actual = mapSchemaToRes(header.schema, ctx, {});
-                    } else if (
-                      header.content &&
-                      typeof header.content === "object"
-                    ) {
+                    } else if (header.content && typeof header.content === "object") {
                       const ents = Object.entries(header.content);
-                      const chosenEntry =
-                        ents.find(([k]) => k === "application/json") ?? ents[0];
+                      const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
                       const chosen = chosenEntry?.[1];
-                      const chosenResolved =
-                        chosen && isRef(chosen)
-                          ? ctx.resolve<MediaTypeObject>(chosen.$ref)
-                          : chosen;
-                      if (chosenResolved && chosenResolved.schema)
-                        actual = mapSchemaToRes(chosenResolved.schema, ctx, {});
+                      const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
+                      if (chosenResolved && chosenResolved.schema) actual = mapSchemaToRes(chosenResolved.schema, ctx, {});
                       else actual = "unknown";
                     }
                   }
@@ -1647,30 +1558,20 @@ function renderOperations(
                     const doc = wrapBlockDoc(`actual: ${actual}`);
                     if (doc) fields.push(doc);
                   }
-                  fields.push(
-                    `${fn.attr ?? ""}${fn.rendered}: option<string>,`
-                  );
+                  fields.push(`${fn.attr ?? ""}${fn.rendered}: option<string>,`);
                 }
                 headerBody = `\n{\n${indentLines(fields, 2)}\n}`;
               } else {
                 headerBody = `emptyObject`;
               }
-              headerTypeDefs.push({ name: headerTypeName, body: headerBody });
+              headerTypeDefs.push({ name: headerTypeName, body: rawIR(headerBody) });
             }
 
-            // Constructor naming similar to src/main.ts
+            // Build variants
             const ctorBase = refNameForCtor ?? "Data";
-            const asAttr = isDefault
-              ? `@as("default") `
-              : !isNaN(n)
-                ? `@as(${status}) `
-                : undefined;
-
+            const asAttr = isDefault ? `@as("default") ` : !isNaN(n) ? `@as(${status}) ` : undefined;
             if (is2xx) {
-              // success variants accumulate for multi-2xx
-              const ctor = isDefault
-                ? `${ctorBase}Default`
-                : `${ctorBase}S${status}`;
+              const ctor = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
               let c = ctor;
               let i = 2;
               while (usedSuccessCtors.has(c)) c = `${ctor}_${i++}`;
@@ -1683,9 +1584,7 @@ function renderOperations(
                 payload = auxName;
               } else if (payload === "unknown") {
                 const auxName = toValidTypeName(`status_${status}_body`);
-                const doc = wrapBlockDoc(
-                  `TODO: ${unknownReason ?? "unknown response body"}`
-                );
+                const doc = wrapBlockDoc(`TODO: ${unknownReason ?? "unknown response body"}`);
                 addSuccessAuxType(auxName, `${doc ? doc + "\n" : ""}unknown`);
                 payload = auxName;
               } else if (payload === "unit" && noContent) {
@@ -1699,7 +1598,6 @@ function renderOperations(
               successPayloadTypes.push(payload);
               successStatusCodes.push(status);
             } else {
-              // error variants: tagged by status/default, payload under `error`
               let c = ctorBase;
               if (usedErrorCtors.has(c)) {
                 c = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
@@ -1710,24 +1608,11 @@ function renderOperations(
               let payload = body ?? "unknown";
               const isInlineRecord = /^\s*\{/.test(payload);
               if (isInlineRecord) {
-                const auxName = toValidTypeName(
-                  `status_${isDefault ? "default" : status}_error`
-                );
+                const auxName = toValidTypeName(`status_${isDefault ? "default" : status}_error`);
                 addAuxType(auxName, payload);
                 payload = auxName;
-              } else if (payload === "unknown") {
-                const auxName = toValidTypeName(
-                  `status_${isDefault ? "default" : status}_error`
-                );
-                const doc = wrapBlockDoc(
-                  `TODO: ${unknownReason ?? "unknown error body"}`
-                );
-                addAuxType(auxName, `${doc ? doc + "\n" : ""}unknown`);
-                payload = auxName;
               } else if (payload === "unit" && noContent) {
-                const auxName = toValidTypeName(
-                  `status_${isDefault ? "default" : status}_error`
-                );
+                const auxName = toValidTypeName(`status_${isDefault ? "default" : status}_error`);
                 const doc = wrapBlockDoc("response has no content");
                 addAuxType(auxName, `${doc ? doc + "\n" : ""}unit`);
                 payload = auxName;
@@ -1736,159 +1621,106 @@ function renderOperations(
               errorVariants.push(variant);
             }
           }
-          // we no longer flatten single-success; always emit status-tagged variants
-        }
 
-        // Emit per-status header types
-        if (headerTypeDefs.length > 0) {
-          const seenHdr = new Set<string>();
-          for (const t of headerTypeDefs) {
-            if (seenHdr.has(t.name)) continue;
-            lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-            seenHdr.add(t.name);
+          // Emit per-status header types
+          if (headerTypeDefs.length > 0) {
+            for (const t of headerTypeDefs) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+          }
+          // Emit success aux types then error aux types (match previous order)
+          if (successAuxTypes.length > 0) {
+            for (const t of successAuxTypes) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+          }
+          if (auxTypes.length > 0) {
+            for (const t of auxTypes) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+          }
+          // status alias after aux types
+          if (successStatusCodes.length > 0) {
+            const uniq = Array.from(new Set(successStatusCodes));
+            const sorted = uniq.sort((a, b) => Number(a) - Number(b));
+            const pv = sorted.map((s) => `#${s}`).join(" | ");
+            modItems.push({ kind: "type", keyword: "type", name: "status", body: rawIR(`[${pv}]`) });
+          }
+          // success
+          if (successVariants.length === 1) {
+            const fields: string[] = [
+              `data: ${successPayloadTypes[0] ?? "unknown"},`,
+              `response: Response.t,`,
+              `${(() => {
+                const code = successStatusCodes[0] ?? "200";
+                const nm = toValidTypeName(`status_${code}_headers`);
+                return `headers: ${nm},`;
+              })()}`,
+              `status: [#${successStatusCodes[0] ?? "200"}],`,
+            ];
+            const succBody = rawIR(`\n{\n${indentLines(fields, 2)}\n}`);
+            modItems.push({ kind: "type", keyword: "type", name: "success", body: succBody });
+          } else if (successVariants.length > 1) {
+            const body = successVariants.map((v) => `| ${v}`).join("\n  ");
+            modItems.push({ kind: "attr", code: '@tag("status")' });
+            modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR(body) });
+          } else {
+            modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR("unknown") });
+          }
+          // error
+          if (errorVariants.length > 0) {
+            const body = errorVariants.map((v) => `| ${v}`).join("\n  ");
+            modItems.push({ kind: "attr", code: '@tag("status")' });
+            modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR(body) });
+          } else {
+            modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR("unknown") });
           }
         }
 
-        // Emit aux types needed for success payloads first (so errors can reference them)
-        if (successAuxTypes.length > 0) {
-          const seenSucc = new Set<string>();
-          for (const t of successAuxTypes) {
-            if (seenSucc.has(t.name)) continue;
-            emitTypeWithDoc(4, t.name, t.body);
-            seenSucc.add(t.name);
-          }
-        }
-
-        // Emit any aux types derived from inline record payloads (errors)
-        if (auxTypes.length > 0) {
-          for (const t of auxTypes) emitTypeWithDoc(4, t.name, t.body);
-        }
-
-        // per-operation status alias (success 2xx codes)
-        if (successStatusCodes.length > 0) {
-          const uniq = Array.from(new Set(successStatusCodes));
-          const sorted = uniq.sort((a, b) => Number(a) - Number(b));
-          const pv = sorted.map((s) => `#${s}`).join(" | ");
-          lines.push(indentLines(`type status = [${pv}]`, 4));
-        }
-        if (successVariants.length === 1) {
-          // Flatten single-success into a record for ergonomics/parity
-          const fields: string[] = [
-            `data: ${successPayloadTypes[0] ?? "unknown"},`,
-            `response: Response.t,`,
-            `${(() => {
-              const code = successStatusCodes[0] ?? "200";
-              const nm = toValidTypeName(`status_${code}_headers`);
-              return `headers: ${nm},`;
-            })()}`,
-            `status: [#${successStatusCodes[0] ?? "200"}],`,
-          ];
-          lines.push(
-            indentLines(`type success = \n{\n${indentLines(fields, 2)}\n}`, 4)
-          );
-        } else if (successVariants.length > 1) {
-          const body = successVariants.map((v) => `| ${v}`).join("\n  ");
-          lines.push(
-            indentLines(`@tag("status")\ntype success =\n  ${body}`, 4)
-          );
-        } else {
-          lines.push(indentLines(`type success = unknown`, 4));
-        }
-
-        if (errorVariants.length > 0) {
-          const body = errorVariants.map((v) => `| ${v}`).join("\n  ");
-          lines.push(indentLines(`@tag("status")\ntype error =\n  ${body}`, 4));
-        } else {
-          lines.push(indentLines(`type error = unknown`, 4));
-        }
-        lines.push(indentLines(`}`, 2));
+        opsItems.push({ kind: "module", name: mod, items: modItems });
       }
     }
-  }
+  };
 
   emitForContainer(paths);
   emitForContainer(webhooks);
 
-  // Emit callback operations (nested under path operations)
+  // Callback operation modules under Operations
   const emitCallbacks = (
     container?: Record<string, PathItemObject | ReferenceObject> | undefined
   ) => {
-    if (!container || typeof container !== "object") return;
-    const METHODS: (keyof PathItemObject)[] = [
-      "get",
-      "put",
-      "post",
-      "delete",
-      "options",
-      "head",
-      "patch",
-      "trace",
-    ];
+    if (!container) return;
     for (const [p, item] of Object.entries(container)) {
       if (!item || typeof item !== "object") continue;
       for (const m of METHODS) {
         const op = "$ref" in item ? undefined : resolveOperation(item[m], ctx);
         if (!op) continue;
         const baseName =
-          op.operationId &&
-          typeof op.operationId === "string" &&
-          op.operationId.length > 0
+          op.operationId && typeof op.operationId === "string" && op.operationId.length > 0
             ? op.operationId
             : `${String(p)}_${String(m)}`;
-        const callbacks = op.callbacks as
-          | Record<
-              string,
-              import("../types.js").CallbackObject | ReferenceObject
-            >
-          | undefined;
+        const callbacks = op.callbacks as Record<string, CallbackObject | ReferenceObject> | undefined;
         if (!callbacks) continue;
         for (const [cbName, cbVal] of Object.entries(callbacks)) {
-          const cbResolved =
-            cbVal && isRef(cbVal)
-              ? ctx.resolve<import("../types.js").CallbackObject>(cbVal.$ref)
-              : cbVal;
+          const cbResolved = cbVal && isRef(cbVal) ? ctx.resolve<CallbackObject>(cbVal.$ref) : cbVal;
           if (!cbResolved) continue;
           for (const [, cbPathItemLike] of Object.entries(cbResolved)) {
-            const cbItem =
-              cbPathItemLike && isRef(cbPathItemLike)
-                ? ctx.resolve<PathItemObject>(cbPathItemLike.$ref)
-                : cbPathItemLike;
+            const cbItem = cbPathItemLike && isRef(cbPathItemLike) ? ctx.resolve<PathItemObject>(cbPathItemLike.$ref) : cbPathItemLike;
             if (!cbItem || typeof cbItem !== "object") continue;
             for (const m2 of METHODS) {
               const cbOp = resolveOperation(cbItem[m2], ctx);
               if (!cbOp) continue;
               const mod = toValidModuleName(`${baseName}_${cbName}_${m2}`);
-              lines.push(indentLines(`module ${mod} = {`, 2));
+              const modItems: RSNode[] = [];
 
-              // PARAMETERS for callback op: collect from callback path-level + op-level
+              // PARAMETERS
               const allParams: Array<unknown> = [];
-              const pathParams = cbItem.parameters as
-                | (import("../types.js").ParameterObject | ReferenceObject)[]
-                | undefined;
+              const pathParams = cbItem.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
               if (Array.isArray(pathParams)) allParams.push(...pathParams);
-              const opParams = cbOp.parameters as
-                | (import("../types.js").ParameterObject | ReferenceObject)[]
-                | undefined;
+              const opParams = cbOp.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
               if (Array.isArray(opParams)) allParams.push(...opParams);
 
               type GroupKey = "query" | "header" | "path" | "cookie";
-              const groups: Record<GroupKey, string[]> = {
-                query: [],
-                header: [],
-                path: [],
-                cookie: [],
-              };
-              const paramAux: Array<{ name: string; body: string }> = [];
+              const groups: Record<GroupKey, string[]> = { query: [], header: [], path: [], cookie: [] };
+              const paramAux: Array<TypeDeclIR> = [];
               const present: Set<GroupKey> = new Set();
-              for (const p of allParams) {
-                const paramLike = p as
-                  | import("../types.js").ParameterObject
-                  | ReferenceObject;
-                const param = isRef(paramLike)
-                  ? ctx.resolve<import("../types.js").ParameterObject>(
-                      paramLike.$ref
-                    )
-                  : paramLike;
+              for (const p2 of allParams) {
+                const paramLike = p2 as import("../types.js").ParameterObject | ReferenceObject;
+                const param = isRef(paramLike) ? ctx.resolve<import("../types.js").ParameterObject>(paramLike.$ref) : paramLike;
                 if (!param || typeof param !== "object") continue;
                 const where = param.in;
                 const name = param.name;
@@ -1897,82 +1729,51 @@ function renderOperations(
                 const schema = param.schema;
                 let ty = "unknown";
                 if (schema) {
-                  const base = toValidTypeName(
-                    `${mod}_${where}_${toValidTypeName(name)}`
-                  );
+                  const base = toValidTypeName(`${mod}_${where}_${toValidTypeName(name)}`);
                   ty = mapSchemaToRes(schema, ctx, {
                     parentName: base,
-                    collectAux: (n, b) => paramAux.push({ name: n, body: b }),
+                    collectAux: (n, b) => {
+                      const { doc, code } = splitDocBlock(b);
+                      paramAux.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                    },
                   });
                 }
                 const fname = toValidResFieldName(name);
                 const sep = required ? ": " : "?: ";
-                groups[where].push(
-                  `${fname.attr ?? ""}${fname.rendered}${sep}${ty},`
-                );
+                groups[where].push(`${fname.attr ?? ""}${fname.rendered}${sep}${ty},`);
                 present.add(where);
               }
 
-              const fieldOrder: GroupKey[] = [
-                "query",
-                "header",
-                "path",
-                "cookie",
-              ];
+              const fieldOrder: GroupKey[] = ["query", "header", "path", "cookie"];
               if (paramAux.length > 0) {
-                for (const t of paramAux) {
-                  const trimmed = t.body.trimStart();
-                  if (trimmed.startsWith("/**")) {
-                    const idx = trimmed.indexOf("*/");
-                    if (idx >= 0) {
-                      const doc = trimmed.slice(0, idx + 2);
-                      const rest = trimmed.slice(idx + 2).trimStart();
-                      lines.push(indentLines(doc, 4));
-                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
-                      continue;
-                    }
-                  }
-                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-                }
+                for (const t of paramAux) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
               }
               for (const k of fieldOrder) {
                 if (!present.has(k)) continue;
                 const body = groups[k];
                 const typeBody = `\n{\n${indentLines(body, 2)}\n}`;
-                lines.push(indentLines(`type ${k} = ${typeBody}`, 4));
+                modItems.push({ kind: "type", keyword: "type", name: k, body: rawIR(typeBody) });
               }
               if (present.size > 0) {
                 const paramsFields: string[] = [];
                 for (const k of fieldOrder) {
                   if (!present.has(k)) continue;
                   const target = toValidResFieldName(k);
-                  paramsFields.push(
-                    `${target.attr ?? ""}${target.rendered}?: ${k},`
-                  );
+                  paramsFields.push(`${target.attr ?? ""}${target.rendered}?: ${k},`);
                 }
-                lines.push(
-                  indentLines(
-                    `type params = \n{\n${indentLines(paramsFields, 2)}\n}`,
-                    4
-                  )
-                );
+                const paramsBody = rawIR(`\n{\n${indentLines(paramsFields, 2)}\n}`);
+                modItems.push({ kind: "type", keyword: "type", name: "params", body: paramsBody });
               }
 
               // REQUEST BODY
               let bodyType: string | undefined = undefined;
               const rb = cbOp.requestBody;
               if (rb) {
-                const req = isRef(rb)
-                  ? ctx.resolve<RequestBodyObject>(rb.$ref)
-                  : rb;
-                const content =
-                  req && req.content && typeof req.content === "object"
-                    ? req.content
-                    : undefined;
+                const req = isRef(rb) ? ctx.resolve<RequestBodyObject>(rb.$ref) : rb;
+                const content = req && req.content && typeof req.content === "object" ? req.content : undefined;
                 if (content) {
                   const entries = Object.entries(content);
-                  let chosen: MediaTypeObject | ReferenceObject | undefined =
-                    undefined;
+                  let chosen: MediaTypeObject | ReferenceObject | undefined = undefined;
                   for (const [k, v] of entries) {
                     if (k === "application/json") {
                       chosen = v;
@@ -1980,55 +1781,23 @@ function renderOperations(
                     }
                   }
                   if (!chosen && entries.length === 1) chosen = entries[0]![1];
-                  const chosenResolved =
-                    chosen && isRef(chosen)
-                      ? ctx.resolve<MediaTypeObject>(chosen.$ref)
-                      : chosen;
+                  const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
                   if (chosenResolved && chosenResolved.schema) {
-                    // Hoist inline union members for callback request bodies
-                    const auxReq: Array<{ name: string; body: string }> = [];
+                    const auxReq: Array<TypeDeclIR> = [];
                     const base = toValidTypeName(`${mod}_request_body`);
                     const mapped = mapSchemaToRes(chosenResolved.schema, ctx, {
                       parentName: base,
-                      collectAux: (n, b) => auxReq.push({ name: n, body: b }),
+                      collectAux: (n, b) => {
+                        const { doc, code } = splitDocBlock(b);
+                        auxReq.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                      },
                     });
                     if (auxReq.length > 0) {
-                      for (const t of auxReq) {
-                        const trimmed = t.body.trimStart();
-                        if (trimmed.startsWith("/**")) {
-                          const idx = trimmed.indexOf("*/");
-                          if (idx >= 0) {
-                            const doc = trimmed.slice(0, idx + 2);
-                            const rest = trimmed.slice(idx + 2).trimStart();
-                            lines.push(indentLines(doc, 4));
-                            lines.push(
-                              indentLines(`type ${t.name} = ${rest}`, 4)
-                            );
-                            continue;
-                          }
-                        }
-                        lines.push(
-                          indentLines(`type ${t.name} = ${t.body}`, 4)
-                        );
-                      }
+                      for (const t of auxReq) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
                     }
                     if (/^\s*\{/.test(mapped)) {
-                      const trimmed = mapped.trimStart();
-                      if (trimmed.startsWith("/**")) {
-                        const idx = trimmed.indexOf("*/");
-                        if (idx >= 0) {
-                          const doc = trimmed.slice(0, idx + 2);
-                          const rest = trimmed.slice(idx + 2).trimStart();
-                          lines.push(indentLines(doc, 4));
-                          lines.push(indentLines(`type ${base} = ${rest}`, 4));
-                        } else {
-                          lines.push(
-                            indentLines(`type ${base} = ${mapped}`, 4)
-                          );
-                        }
-                      } else {
-                        lines.push(indentLines(`type ${base} = ${mapped}`, 4));
-                      }
+                      const { doc: bdoc, code: bcode } = splitDocBlock(mapped);
+                      modItems.push({ kind: "type", keyword: "type", name: base, body: withDoc(bdoc, rawIR(bcode)) });
                       bodyType = base;
                     } else {
                       bodyType = mapped;
@@ -2039,56 +1808,49 @@ function renderOperations(
                 }
               }
 
+              // PARAMETERS wrapper
               const parametersFields: string[] = [];
               if (present.size > 0) parametersFields.push("params?: params,");
               if (bodyType) parametersFields.push(`body?: ${bodyType},`);
               if (parametersFields.length > 0) {
-                lines.push(
-                  indentLines(
-                    `type parameters = \n{\n${indentLines(parametersFields, 2)}\n}`,
-                    4
-                  )
-                );
+                const pBody = rawIR(`\n{\n${indentLines(parametersFields, 2)}\n}`);
+                modItems.push({ kind: "type", keyword: "type", name: "parameters", body: pBody });
               } else {
-                lines.push(indentLines(`type parameters = emptyObject`, 4));
+                modItems.push({ kind: "type", keyword: "type", name: "parameters", body: rawIR("emptyObject") });
               }
 
-              // RESPONSES
+              // RESPONSES (callbacks)
               const responses = cbOp.responses;
               const successVariants: string[] = [];
               const successPayloadTypes: string[] = [];
               const successStatusCodes: string[] = [];
               const errorVariants: string[] = [];
-              const auxTypes: Array<{ name: string; body: string }> = [];
-              const successAuxTypes: Array<{ name: string; body: string }> = [];
-              const addAuxType = (name: string, body: string) =>
-                auxTypes.push({ name, body });
-              const addSuccessAuxType = (name: string, body: string) =>
-                successAuxTypes.push({ name, body });
-              const usedSuccessCtors = new Set<string>();
-              const usedErrorCtors = new Set<string>();
-              const headerTypeDefs: Array<{ name: string; body: string }> = [];
+              const auxTypes: Array<TypeDeclIR> = [];
+              const successAuxTypes: Array<TypeDeclIR> = [];
+              const usedSuccessCtors: Set<string> = new Set();
+              const usedErrorCtors: Set<string> = new Set();
+              const headerTypeDefs: Array<TypeDeclIR> = [];
               if (responses && typeof responses === "object") {
                 const entries = Object.entries(responses);
                 const bodies: Array<{ code: string; ty: string }> = [];
                 for (const [status, respLike] of entries) {
-                  const resp = isRef(respLike)
-                    ? ctx.resolve<ResponseObject>(respLike.$ref)
-                    : respLike;
+                  const resp = isRef(respLike) ? ctx.resolve<ResponseObject>(respLike.$ref) : respLike;
                   if (!resp || typeof resp !== "object") continue;
                   let body: string | undefined;
                   let unknownReason: string | undefined;
                   let noContent: boolean = false;
                   if (resp.content && typeof resp.content === "object") {
                     const ents = Object.entries(resp.content);
-                    const chosenEntry =
-                      ents.find(([k]) => k === "application/json") ?? ents[0];
+                    const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
                     const chosen = chosenEntry?.[1];
                     if (chosen && chosen.schema) {
                       const base = toValidTypeName(`status_${status}_body`);
                       body = mapSchemaToRes(chosen.schema, ctx, {
                         parentName: base,
-                        collectAux: (n, b) => addSuccessAuxType(n, b),
+                        collectAux: (n, b) => {
+                          const { doc, code } = splitDocBlock(b);
+                          successAuxTypes.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                        },
                         optionalAsOption: true,
                       });
                     } else {
@@ -2102,51 +1864,25 @@ function renderOperations(
                   const isDefault = status === "default";
                   const n = Number(status);
                   const is2xx = !isNaN(n) && n >= 200 && n < 300;
-                  const refNameForCtor = isRef(respLike)
-                    ? refName(respLike.$ref)
-                    : undefined;
+                  const refNameForCtor = isRef(respLike) ? refName(respLike.$ref) : undefined;
                   if (is2xx && body) bodies.push({ code: status, ty: body });
-
-                  // Build per-status headers type
                   const headersVal = resp.headers;
-                  const headerTypeName = toValidTypeName(
-                    `status_${status === "default" ? "default" : status}_headers`
-                  );
+                  const headerTypeName = toValidTypeName(`status_${status === "default" ? "default" : status}_headers`);
                   if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
                     let headerBody: string;
-                    if (
-                      headersVal &&
-                      typeof headersVal === "object" &&
-                      Object.keys(headersVal).length > 0
-                    ) {
+                    if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
                       const fields: string[] = [];
                       for (const [hname, hlike] of Object.entries(headersVal)) {
-                        const header: HeaderObject | undefined = isRef(hlike)
-                          ? ctx.resolve<HeaderObject>(hlike.$ref)
-                          : hlike;
+                        const header: HeaderObject | undefined = isRef(hlike) ? ctx.resolve<HeaderObject>(hlike.$ref) : hlike;
                         let actual: string = "string";
                         if (header && typeof header === "object") {
-                          if (header.schema)
-                            actual = mapSchemaToRes(header.schema, ctx, {});
-                          else if (
-                            header.content &&
-                            typeof header.content === "object"
-                          ) {
+                          if (header.schema) actual = mapSchemaToRes(header.schema, ctx, {});
+                          else if (header.content && typeof header.content === "object") {
                             const ents = Object.entries(header.content);
-                            const chosenEntry =
-                              ents.find(([k]) => k === "application/json") ??
-                              ents[0];
+                            const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
                             const chosen = chosenEntry?.[1];
-                            const chosenResolved =
-                              chosen && isRef(chosen)
-                                ? ctx.resolve<MediaTypeObject>(chosen.$ref)
-                                : chosen;
-                            if (chosenResolved && chosenResolved.schema)
-                              actual = mapSchemaToRes(
-                                chosenResolved.schema,
-                                ctx,
-                                {}
-                              );
+                            const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
+                            if (chosenResolved && chosenResolved.schema) actual = mapSchemaToRes(chosenResolved.schema, ctx, {});
                             else actual = "unknown";
                           }
                         }
@@ -2155,30 +1891,19 @@ function renderOperations(
                           const doc = wrapBlockDoc(`actual: ${actual}`);
                           if (doc) fields.push(doc);
                         }
-                        fields.push(
-                          `${fn.attr ?? ""}${fn.rendered}: option<string>,`
-                        );
+                        fields.push(`${fn.attr ?? ""}${fn.rendered}: option<string>,`);
                       }
                       headerBody = `\n{\n${indentLines(fields, 2)}\n}`;
                     } else {
                       headerBody = `emptyObject`;
                     }
-                    headerTypeDefs.push({
-                      name: headerTypeName,
-                      body: headerBody,
-                    });
+                    headerTypeDefs.push({ name: headerTypeName, body: rawIR(headerBody) });
                   }
 
+                  const ctorBase = refNameForCtor ?? "Data";
+                  const asAttr = isDefault ? `@as("default") ` : !isNaN(n) ? `@as(${status}) ` : undefined;
                   if (is2xx) {
-                    const ctorBase = refNameForCtor ?? "Data";
-                    const asAttr = isDefault
-                      ? `@as("default") `
-                      : !isNaN(n)
-                        ? `@as(${status}) `
-                        : undefined;
-                    const ctor = isDefault
-                      ? `${ctorBase}Default`
-                      : `${ctorBase}S${status}`;
+                    const ctor = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
                     let c = ctor;
                     let i = 2;
                     while (usedSuccessCtors.has(c)) c = `${ctor}_${i++}`;
@@ -2187,25 +1912,17 @@ function renderOperations(
                     const isInlineRecord = /^\s*\{/.test(payload);
                     if (isInlineRecord) {
                       const auxName = toValidTypeName(`status_${status}_body`);
-                      addSuccessAuxType(auxName, payload);
+                      successAuxTypes.push({ name: auxName, body: rawIR(payload) });
                       payload = auxName;
                     } else if (payload === "unknown") {
                       const auxName = toValidTypeName(`status_${status}_body`);
-                      const doc = wrapBlockDoc(
-                        `TODO: ${unknownReason ?? "unknown response body"}`
-                      );
-                      addSuccessAuxType(
-                        auxName,
-                        `${doc ? doc + "\n" : ""}unknown`
-                      );
+                      const doc = wrapBlockDoc(`TODO: ${unknownReason ?? "unknown response body"}`);
+                      successAuxTypes.push({ name: auxName, body: withDoc(doc, rawIR("unknown")) });
                       payload = auxName;
                     } else if (payload === "unit" && noContent) {
                       const auxName = toValidTypeName(`status_${status}_body`);
                       const doc = wrapBlockDoc("response has no content");
-                      addSuccessAuxType(
-                        auxName,
-                        `${doc ? doc + "\n" : ""}unit`
-                      );
+                      successAuxTypes.push({ name: auxName, body: withDoc(doc, rawIR("unit")) });
                       payload = auxName;
                     }
                     const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
@@ -2213,9 +1930,9 @@ function renderOperations(
                     successPayloadTypes.push(payload);
                     successStatusCodes.push(status);
                   } else {
-                    let c = refNameForCtor ?? "Error";
+                    let c = ctorBase;
                     if (usedErrorCtors.has(c)) {
-                      c = isDefault ? `${c}Default` : `${c}S${status}`;
+                      c = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
                       let j = 2;
                       while (usedErrorCtors.has(c)) c = `${c}_${j++}`;
                     }
@@ -2223,104 +1940,47 @@ function renderOperations(
                     let payload = body ?? "unknown";
                     const isInlineRecord = /^\s*\{/.test(payload);
                     if (isInlineRecord) {
-                      const auxName = toValidTypeName(
-                        `status_${isDefault ? "default" : status}_error`
-                      );
-                      addAuxType(auxName, payload);
-                      payload = auxName;
-                    } else if (payload === "unknown") {
-                      const auxName = toValidTypeName(
-                        `status_${isDefault ? "default" : status}_error`
-                      );
-                      const doc = wrapBlockDoc(
-                        `TODO: ${unknownReason ?? "unknown error body"}`
-                      );
-                      addAuxType(auxName, `${doc ? doc + "\n" : ""}unknown`);
-                      payload = auxName;
-                    } else if (payload === "unit" && noContent) {
-                      const auxName = toValidTypeName(
-                        `status_${isDefault ? "default" : status}_error`
-                      );
-                      const doc = wrapBlockDoc("response has no content");
-                      addAuxType(auxName, `${doc ? doc + "\n" : ""}unit`);
+                      const auxName = toValidTypeName(`status_${isDefault ? "default" : status}_error`);
+                      auxTypes.push({ name: auxName, body: rawIR(payload) });
                       payload = auxName;
                     }
-                    const asAttr = isDefault
-                      ? `@as("default") `
-                      : !isNaN(Number(status))
-                        ? `@as(${status}) `
-                        : undefined;
                     const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
                     errorVariants.push(variant);
                   }
                 }
-                // Always emit variants; do not flatten single-success cases
+
+                if (headerTypeDefs.length > 0) {
+                  for (const t of headerTypeDefs) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                }
+                if (auxTypes.length > 0) {
+                  for (const t of auxTypes) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                }
+                if (successStatusCodes.length > 0) {
+                  const uniq = Array.from(new Set(successStatusCodes));
+                  const sorted = uniq.sort((a, b) => Number(a) - Number(b));
+                  const pv = sorted.map((s) => `#${s}`).join(" | ");
+                  modItems.push({ kind: "type", keyword: "type", name: "status", body: rawIR(`[${pv}]`) });
+                }
+                if (successAuxTypes.length > 0) {
+                  for (const t of successAuxTypes) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                }
+                if (successVariants.length >= 1) {
+                  const body = successVariants.map((v) => `| ${v}`).join("\n  ");
+                  modItems.push({ kind: "attr", code: '@tag("status")' });
+                  modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR(body) });
+                } else {
+                  modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR("unknown") });
+                }
+                if (errorVariants.length > 0) {
+                  const body = errorVariants.map((v) => `| ${v}`).join("\n  ");
+                  modItems.push({ kind: "attr", code: '@tag("status")' });
+                  modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR(body) });
+                } else {
+                  modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR("unknown") });
+                }
               }
 
-              // Emit per-status header types
-              if (headerTypeDefs.length > 0) {
-                for (const t of headerTypeDefs) {
-                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-                }
-              }
-              // Emit error aux types
-              if (auxTypes.length > 0) {
-                for (const t of auxTypes) {
-                  const trimmed = t.body.trimStart();
-                  if (trimmed.startsWith("/**")) {
-                    const idx = trimmed.indexOf("*/");
-                    if (idx >= 0) {
-                      const doc = trimmed.slice(0, idx + 2);
-                      const rest = trimmed.slice(idx + 2).trimStart();
-                      lines.push(indentLines(doc, 4));
-                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
-                      continue;
-                    }
-                  }
-                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-                }
-              }
-              // per-operation status alias (success 2xx codes)
-              if (successStatusCodes.length > 0) {
-                const uniq = Array.from(new Set(successStatusCodes));
-                const sorted = uniq.sort((a, b) => Number(a) - Number(b));
-                const pv = sorted.map((s) => `#${s}`).join(" | ");
-                lines.push(indentLines(`type status = [${pv}]`, 4));
-              }
-              if (successAuxTypes.length > 0) {
-                for (const t of successAuxTypes) {
-                  const trimmed = t.body.trimStart();
-                  if (trimmed.startsWith("/**")) {
-                    const idx = trimmed.indexOf("*/");
-                    if (idx >= 0) {
-                      const doc = trimmed.slice(0, idx + 2);
-                      const rest = trimmed.slice(idx + 2).trimStart();
-                      lines.push(indentLines(doc, 4));
-                      lines.push(indentLines(`type ${t.name} = ${rest}`, 4));
-                      continue;
-                    }
-                  }
-                  lines.push(indentLines(`type ${t.name} = ${t.body}`, 4));
-                }
-              }
-              if (successVariants.length >= 1) {
-                const body = successVariants.map((v) => `| ${v}`).join("\n  ");
-                lines.push(
-                  indentLines(`@tag("status")\ntype success =\n  ${body}`, 4)
-                );
-              } else {
-                lines.push(indentLines(`type success = unknown`, 4));
-              }
-              if (errorVariants.length > 0) {
-                const body = errorVariants.map((v) => `| ${v}`).join("\n  ");
-                lines.push(
-                  indentLines(`@tag("status")\ntype error =\n  ${body}`, 4)
-                );
-              } else {
-                lines.push(indentLines(`type error = unknown`, 4));
-              }
-
-              lines.push(indentLines(`}`, 2));
+              opsItems.push({ kind: "module", name: mod, items: modItems });
             }
           }
         }
@@ -2330,15 +1990,14 @@ function renderOperations(
 
   emitCallbacks(paths);
 
-  lines.push("}");
-  return lines;
+  return { kind: "module", name: "Operations", items: opsItems };
 }
 
-function renderPaths(
+function buildPaths(
   paths: PathsObject | undefined,
   ctx: RSContext
-): { lines: string[]; hasClient: boolean } {
-  const lines: string[] = [];
+): { nodes: RSNode[]; hasClient: boolean } {
+  const nodes: RSNode[] = [];
   const METHODS: (keyof PathItemObject)[] = [
     "get",
     "put",
@@ -2367,7 +2026,6 @@ function renderPaths(
     }
   }
 
-  // Helper: choose unique type name per path
   const usedNames = new Set<string>();
   const typeNameForPath = (pe: PathEntry): string => {
     const primary = pe.entries[0]?.opId;
@@ -2379,7 +2037,6 @@ function renderPaths(
     return name;
   };
 
-  // Emit per-path operation record types
   const clientFields: string[] = [];
   for (const pe of pathEntries) {
     if (pe.entries.length === 0) continue;
@@ -2392,25 +2049,25 @@ function renderPaths(
       const asAttr = `@as(${JSON.stringify(e.method.toUpperCase())}) `;
       fields.push(`${asAttr}${target.rendered}: ${fnType},`);
     }
-    lines.push(`type ${typeName} = \n{\n${indentLines(fields, 2)}\n}`);
-    lines.push("");
+    nodes.push({ kind: "type", keyword: "type", name: typeName, body: rawIR(`\n{\n${indentLines(fields, 2)}\n}`) });
+    nodes.push({ kind: "blank" });
     clientFields.push(`${JSON.stringify(pe.path)}: ${typeName},`);
   }
 
   let hasClient = false;
   if (clientFields.length > 0) {
     const rows = stripLastComma(clientFields);
-    lines.push(`type client = \n{.\n${indentLines(rows, 2)}\n}`);
+    nodes.push({ kind: "type", keyword: "type", name: "client", body: rawIR(`\n{.\n${indentLines(rows, 2)}\n}`) });
     hasClient = true;
   }
-  return { lines, hasClient };
+  return { nodes, hasClient };
 }
 
-function renderWebhooks(
+function buildWebhooks(
   webhooks: OpenAPI3["webhooks"] | undefined,
   ctx: RSContext
-): { lines: string[] } {
-  const lines: string[] = [];
+): { nodes: RSNode[] } {
+  const nodes: RSNode[] = [];
   const METHODS: (keyof PathItemObject)[] = [
     "get",
     "put",
@@ -2449,31 +2106,27 @@ function renderWebhooks(
       const asAttr = `@as(${JSON.stringify(e.method.toUpperCase())}) `;
       fields.push(`${asAttr}${target.rendered}: ${fnType},`);
     }
-    lines.push(
-      `type ${toValidTypeName(`${he.name}_webhook`)} = \n{\n${indentLines(fields, 2)}\n}`
-    );
-    lines.push("");
+    nodes.push({ kind: "type", keyword: "type", name: toValidTypeName(`${he.name}_webhook`), body: rawIR(`\n{\n${indentLines(fields, 2)}\n}`) });
+    nodes.push({ kind: "blank" });
   }
 
   const clientFields: string[] = [];
   for (const he of hookEntries) {
     if (he.entries.length === 0) continue;
-    clientFields.push(
-      `${JSON.stringify(he.name)}: ${toValidTypeName(`${he.name}_webhook`)},`
-    );
+    clientFields.push(`${JSON.stringify(he.name)}: ${toValidTypeName(`${he.name}_webhook`)},`);
   }
   if (clientFields.length > 0) {
     const rows = stripLastComma(clientFields);
-    lines.push(`type webhooks = \n{.\n${indentLines(rows, 2)}\n}`);
+    nodes.push({ kind: "type", keyword: "type", name: "webhooks", body: rawIR(`\n{.\n${indentLines(rows, 2)}\n}`) });
   }
-  return { lines };
+  return { nodes };
 }
 
-function renderCallbacks(
+function buildCallbacks(
   paths: PathsObject | undefined,
   ctx: RSContext
-): { lines: string[] } {
-  const lines: string[] = [];
+): { nodes: RSNode[] } {
+  const nodes: RSNode[] = [];
   const METHODS: (keyof PathItemObject)[] = [
     "get",
     "put",
@@ -2533,13 +2186,13 @@ function renderCallbacks(
   for (const ent of entriesByOp.values()) {
     if (ent.fields.length === 0) continue;
     const tn = toValidTypeName(`${ent.opId}_callbacks`);
-    lines.push(`type ${tn} = \n{\n${indentLines(ent.fields, 2)}\n}`);
-    lines.push("");
+    nodes.push({ kind: "type", keyword: "type", name: tn, body: rawIR(`\n{\n${indentLines(ent.fields, 2)}\n}`) });
+    nodes.push({ kind: "blank" });
     clientFields.push(`${JSON.stringify(ent.opId)}: ${tn},`);
   }
   if (clientFields.length > 0) {
     const rows = stripLastComma(clientFields);
-    lines.push(`type callbacks = \n{.\n${indentLines(rows, 2)}\n}`);
+    nodes.push({ kind: "type", keyword: "type", name: "callbacks", body: rawIR(`\n{.\n${indentLines(rows, 2)}\n}`) });
   }
-  return { lines };
+  return { nodes };
 }
