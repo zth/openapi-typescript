@@ -1,5 +1,5 @@
 import { indentLines } from "./utils.js";
-import type { RSNode, TypeIR } from "./ir.js";
+import type { RSNode, TypeIR, FieldIR } from "./ir.js";
 
 function printTypeIR(t: TypeIR): string {
   switch (t.kind) {
@@ -8,6 +8,52 @@ function printTypeIR(t: TypeIR): string {
     case "withDoc": {
       const inner = printTypeIR(t.inner);
       return `${t.doc}\n${inner}`;
+    }
+    case "ref": {
+      return t.path.join(".");
+    }
+    case "app": {
+      const callee = printTypeIR(t.callee);
+      const args = t.args.map(printTypeIR).join(", ");
+      return `${callee}<${args}>`;
+    }
+    case "record": {
+      const lines: string[] = [];
+      const emitField = (f: FieldIR) => {
+        if (f.doc) lines.push(f.doc);
+        const head = `${f.attr ?? ""}${f.name}`;
+        const ty = printTypeIR(f.typ);
+        if (f.optional === "questionMark") {
+          lines.push(`${head}?: ${ty},`);
+        } else if (f.optional === "option") {
+          lines.push(`${head}: option<${ty}>,`);
+        } else {
+          lines.push(`${head}: ${ty},`);
+        }
+      };
+      for (const f of t.fields) emitField(f);
+      return `\n{\n${indentLines(lines, 2)}\n}`;
+    }
+    case "poly": {
+      const cases = t.cases
+        .map((c) =>
+          c.payload ? `${c.label}(${printTypeIR(c.payload)})` : `${c.label}`
+        )
+        .join(" | ");
+      return `[${cases}]`;
+    }
+    case "adt": {
+      const cases = t.cases
+        .map((c) => {
+          const head = `${c.attr ?? ""}${c.label}`;
+          return c.payload ? `${head}(${printTypeIR(c.payload)})` : head;
+        })
+        .join("\n  | ");
+      return `| ${cases}`;
+    }
+    case "tuple": {
+      const items = t.items.map(printTypeIR).join(", ");
+      return `(${items})`;
     }
   }
 }
@@ -63,4 +109,3 @@ export function printFile(nodes: RSNode[]): string {
 }
 
 export { printTypeIR, printTypeDecl };
-

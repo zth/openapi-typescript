@@ -28,9 +28,9 @@ import {
   toValidTypeName,
   wrapBlockDoc,
 } from "./utils.js";
-import type { RSNode, TypeIR } from "./ir.js";
-import { raw as rawIR, withDoc } from "./ir.js";
-import { printFile } from "./printer.js";
+import type { RSNode, TypeIR, FieldIR } from "./ir.js";
+import { raw as rawIR, withDoc, ref as refIR, app as appIR, record as recordIR, poly as polyIR, adt as adtIR } from "./ir.js";
+import { printFile, printTypeIR } from "./printer.js";
 
 function hasDefs(s: SchemaObject): s is SchemaObject & { $defs: $defs } {
   return "$defs" in s && s.$defs != null && typeof s.$defs === "object";
@@ -183,6 +183,145 @@ function splitDocBlock(body: string): { doc?: string; code: string } {
 
 // (removed) legacy local printers; all code now builds RS IR and is printed by printer.ts
 
+// Structural equality for a useful subset of TypeIR nodes.
+function alphaEq(a: TypeIR, b: TypeIR): boolean {
+  if (a === b) return true;
+  if (a.kind === "withDoc") return alphaEq(a.inner, b);
+  if (b.kind === "withDoc") return alphaEq(a, b.inner);
+  if (a.kind !== b.kind) return false;
+  switch (a.kind) {
+    case "raw": {
+      if (b.kind !== "raw") return false;
+      return a.code.trim() === b.code.trim();
+    }
+    case "ref": {
+      const bb = b as Extract<TypeIR, { kind: "ref" }>;
+      return a.path.join(".") === bb.path.join(".");
+    }
+    case "app": {
+      const bb = b as Extract<TypeIR, { kind: "app" }>;
+      if (!alphaEq(a.callee, bb.callee)) return false;
+      if (a.args.length !== bb.args.length) return false;
+      for (let i = 0; i < a.args.length; i++) if (!alphaEq(a.args[i]!, bb.args[i]!)) return false;
+      return true;
+    }
+    case "record": {
+      const bb = b as Extract<TypeIR, { kind: "record" }>;
+      if (a.fields.length !== bb.fields.length) return false;
+      const af = [...a.fields].map((f) => ({ n: `${f.attr ?? ""}${f.name}`, o: f.optional, t: f.typ })).sort((x, y) => x.n.localeCompare(y.n));
+      const bf = [...bb.fields].map((f) => ({ n: `${f.attr ?? ""}${f.name}`, o: f.optional, t: f.typ })).sort((x, y) => x.n.localeCompare(y.n));
+      for (let i = 0; i < af.length; i++) {
+        if (af[i]!.n !== bf[i]!.n) return false;
+        if (af[i]!.o !== bf[i]!.o) return false;
+        if (!alphaEq(af[i]!.t, bf[i]!.t)) return false;
+      }
+      return true;
+    }
+    case "poly": {
+      const bb = b as Extract<TypeIR, { kind: "poly" }>;
+      if (a.cases.length !== bb.cases.length) return false;
+      const ac = [...a.cases].map((c) => ({ l: c.label, p: c.payload })).sort((x, y) => x.l.localeCompare(y.l));
+      const bc = [...bb.cases].map((c) => ({ l: c.label, p: c.payload })).sort((x, y) => x.l.localeCompare(y.l));
+      for (let i = 0; i < ac.length; i++) {
+        if (ac[i]!.l !== bc[i]!.l) return false;
+        const ap = ac[i]!.p;
+        const bp = bc[i]!.p;
+        if ((ap == null) !== (bp == null)) return false;
+        if (ap && bp && !alphaEq(ap, bp)) return false;
+      }
+      return true;
+    }
+    case "tuple": {
+      const bb = b as Extract<TypeIR, { kind: "tuple" }>;
+      if (a.items.length !== bb.items.length) return false;
+      for (let i = 0; i < a.items.length; i++) if (!alphaEq(a.items[i]!, bb.items[i]!)) return false;
+      return true;
+    }
+    case "adt": {
+      // For now, be conservative; compare printed representations
+      return printTypeIR(a) === printTypeIR(b);
+    }
+  }
+}
+
+function pvLabelForValue(v: string): string {
+  const isIdent = /^[A-Za-z_][A-Za-z0-9_]*$/.test(v);
+  const isReserved = RES_KEYWORDS.has(v);
+  return isIdent && !isReserved ? `#${v}` : `#${JSON.stringify(v)}`;
+}
+
+function isNullApp(t: TypeIR): t is Extract<TypeIR, { kind: "app" }> {
+  return (
+    t.kind === "app" &&
+    t.callee.kind === "ref" &&
+    t.callee.path.join(".") === "Null.t" &&
+    Array.isArray(t.args) &&
+    t.args.length === 1
+  );
+}
+
+function unwrapNull(t: TypeIR): TypeIR | undefined {
+  if (isNullApp(t)) return t.args[0]!;
+  return undefined;
+}
+
+// Hoist inline record field types to aux types to reduce nesting and avoid Null.t<{..}>.
+function hoistFieldTypeIfNeeded(
+  typ: TypeIR,
+  collectAux: ((name: string, body: string) => void) | undefined,
+  parentName: string | undefined,
+  propName: string
+): TypeIR {
+  if (typ.kind === "record" && typeof collectAux === "function") {
+    const printed = printTypeIR(typ);
+    const baseParent = parentName ?? "t";
+    const propBase = toValidTypeName(`${baseParent}_${propName}`);
+    const auxName = nameWithHash(propBase, printed);
+    collectAux(auxName, printed);
+    return refIR(auxName);
+  }
+  if (isNullApp(typ) && typ.args[0]!.kind === "record" && typeof collectAux === "function") {
+    const rec = typ.args[0]!;
+    const printed = printTypeIR(rec);
+    const baseParent = parentName ?? "t";
+    const propBase = toValidTypeName(`${baseParent}_${propName}`);
+    const auxName = nameWithHash(propBase, printed);
+    collectAux(auxName, printed);
+    return appIR(refIR("Null.t"), [refIR(auxName)]);
+  }
+  return typ;
+}
+
+function isRefNamed(t: TypeIR, name: string): boolean {
+  return t.kind === "ref" && t.path.join(".") === name;
+}
+
+function isArrayIR(t: TypeIR): t is Extract<TypeIR, { kind: "app" }> & { callee: Extract<TypeIR, { kind: "ref" }> } {
+  return t.kind === "app" && t.callee.kind === "ref" && t.callee.path.join(".") === "array" && t.args.length === 1;
+}
+
+function chooseNarrowerIR(a: TypeIR, b: TypeIR): "a" | "b" | undefined {
+  if (alphaEq(a, b)) return "a";
+  const aNull = isNullApp(a);
+  const bNull = isNullApp(b);
+  if (!!aNull && !bNull) return "a";
+  if (!!bNull && !aNull) return "b";
+  const aCore = aNull ? aNull.args[0]! : a;
+  const bCore = bNull ? bNull.args[0]! : b;
+  const aArr = isArrayIR(aCore) ? aCore : undefined;
+  const bArr = isArrayIR(bCore) ? bCore : undefined;
+  if (aArr && bArr) {
+    const res = chooseNarrowerIR(aArr.args[0]!, bArr.args[0]!);
+    return res ?? "a";
+  }
+  // Prefer PV union over primitive string/float
+  const aIsPrim = aCore.kind === "ref" && (isRefNamed(aCore, "string") || isRefNamed(aCore, "float"));
+  const bIsPrim = bCore.kind === "ref" && (isRefNamed(bCore, "string") || isRefNamed(bCore, "float"));
+  if (aIsPrim && bCore.kind === "poly") return "b";
+  if (bIsPrim && aCore.kind === "poly") return "a";
+  return undefined;
+}
+
 function mapSchemaToRes(
   schema: SchemaLike,
   ctx: RSContext,
@@ -273,10 +412,10 @@ function mapSchemaToRes(
     const hasNull = arr.includes("null");
     const others = arr.filter((t) => t !== "null");
     if (hasNull && others.length === 1) {
-      const tmp = {
+      const tmp: SchemaObject = {
         ...s,
         type: others[0],
-      } as SchemaObject;
+      };
       let inner = mapSchemaToRes(tmp, ctx, {
         parentName,
         collectAux,
@@ -600,7 +739,7 @@ function mapSchemaToRes(
       if (ap === false) {
         return s.nullable ? `Null.t<emptyObject>` : `emptyObject`;
       }
-      let inner = mapSchemaToRes(ap as SchemaLike, ctx, {
+      let inner = mapSchemaToRes(ap as SchemaObject | ReferenceObject, ctx, {
         parentName,
         collectAux,
         optionalAsOption,
@@ -687,11 +826,10 @@ function mapSchemaToRes(
   if (Array.isArray(s.allOf) && s.allOf.length > 0) {
     const members = s.allOf!;
 
-    const tryInlineObject = (v: unknown): SchemaObject | undefined => {
-      if (!v || typeof v !== "object") return undefined;
+    const tryInlineObject = (v: SchemaLike): SchemaObject | undefined => {
       let node: SchemaObject | undefined;
       if (isRef(v)) node = ctx.resolve<SchemaObject>(v.$ref);
-      else node = v as SchemaObject;
+      else node = v;
       if (!node) return undefined;
       if (Array.isArray(node.allOf) && node.allOf.length > 0) {
         for (const m of node.allOf) {
@@ -708,9 +846,9 @@ function mapSchemaToRes(
       return undefined;
     };
 
-    const isAnnotationOnly = (s: any): boolean => {
-      if (!s || typeof s !== "object") return false;
-      const keys = Object.keys(s);
+    const isAnnotationOnly = (node: unknown): boolean => {
+      if (!node || typeof node !== "object") return false;
+      const keys = Object.keys(node as Record<string, unknown>);
       const structural = [
         "type",
         "properties",
@@ -802,11 +940,10 @@ function mapSchemaToRes(
       return undefined;
     };
 
-    const isArraySchema = (v: unknown): SchemaObject | undefined => {
-      if (!v || typeof v !== "object") return undefined;
+    const isArraySchema = (v: SchemaLike | SchemaObject): SchemaObject | undefined => {
       const node = isRef(v)
         ? ctx.resolve<SchemaObject>(v.$ref)
-        : (v as SchemaObject);
+        : v;
       if (!node || typeof node !== "object") return undefined;
       const hasPrefixItems =
         "prefixItems" in node && Array.isArray(node.prefixItems);
@@ -825,11 +962,10 @@ function mapSchemaToRes(
       return undefined;
     };
 
-    const isScalarSchema = (v: unknown): v is SchemaObject => {
-      if (!v || typeof v !== "object") return false;
+    const isScalarSchema = (v: SchemaLike | SchemaObject): v is SchemaObject => {
       let node: SchemaObject | undefined;
       if (isRef(v)) node = ctx.resolve<SchemaObject>(v.$ref);
-      else node = v as SchemaObject;
+      else node = v;
       if (!node || typeof node !== "object") return false;
       if ("const" in node) return true;
       if (Array.isArray(node.enum)) return true;
@@ -1082,6 +1218,537 @@ function mapSchemaToRes(
   return "unknown";
 }
 
+// Experimental: structured IR for a subset of schema shapes (objects first).
+// Falls back to raw string mapping for unsupported cases to preserve semantics.
+function mapSchemaToIR(
+  schema: SchemaLike,
+  ctx: RSContext,
+  {
+    parentName,
+    collectAux,
+    optionalAsOption = false,
+  }: {
+    parentName?: string;
+    collectAux?: (name: string, body: string) => void;
+    optionalAsOption?: boolean;
+  } = {}
+): TypeIR {
+  // Pre-hoist $defs if present (mirrors string path behavior)
+  if (!isRef(schema)) {
+    const s: SchemaObject = schema;
+    // Basic primitives and nullable type arrays → IR
+    if (Array.isArray((s as any).type)) {
+      const arr = (s as any).type as unknown[];
+      const hasNull = arr.includes("null");
+      const others = arr.filter((t) => t !== "null");
+      if (hasNull && others.length === 1) {
+        const tmp: SchemaObject = { ...s, type: others[0] as any };
+        const inner = mapSchemaToIR(tmp, ctx, { parentName, collectAux, optionalAsOption });
+        return appIR(refIR("Null.t"), [inner]);
+      }
+    }
+    if (typeof (s as any).type === "string" && !(Array.isArray((s as any).enum) && (s as any).enum.length > 0)) {
+      const t = (s as any).type as string;
+      if (t === "string" || t === "number" || t === "integer" || t === "boolean") {
+        const base = t === "string" ? refIR("string") : t === "boolean" ? refIR("bool") : refIR("float");
+        return s.nullable ? appIR(refIR("Null.t"), [base]) : base;
+      }
+    }
+    // composition: oneOf / anyOf → PV union wrapped in Wrapped.t when possible
+    const unionMembers = s.oneOf ?? s.anyOf;
+    if (Array.isArray(unionMembers) && unionMembers.length > 0) {
+      const isNullTypeSchema = (m: SchemaLike | SchemaObject): boolean => {
+        let mm: SchemaObject | undefined;
+        if (isRef(m)) mm = ctx.resolve<SchemaObject>(m.$ref);
+        else mm = m;
+        if (!mm) return false;
+        if (mm.type === "null") return true;
+        if (Array.isArray(mm.type)) {
+          let hasNull = false;
+          let count = 0;
+          for (const t of mm.type) {
+            count++;
+            if (t === "null") hasNull = true;
+          }
+          return hasNull && count === 1;
+        }
+        if (Array.isArray(mm.enum)) {
+          return mm.enum.length === 1 && mm.enum[0] == null;
+        }
+        return false;
+      };
+      const nonNullMembers = unionMembers.filter((m) => !isNullTypeSchema(m));
+      const nullMembers = unionMembers.length - nonNullMembers.length;
+      if (nullMembers >= 1 && nonNullMembers.length === 1) {
+        const inner = mapSchemaToIR(nonNullMembers[0]!, ctx, { parentName, collectAux, optionalAsOption });
+        return appIR(refIR("Null.t"), [inner]);
+      }
+      const allRefs = unionMembers.every((m) => isRef(m));
+      const disc: DiscriminatorObject | undefined = s.discriminator;
+      let mapRefNameToLabel: Map<string, string> | undefined;
+      if (disc && typeof disc === "object" && disc.mapping && typeof disc.mapping === "object") {
+        mapRefNameToLabel = new Map<string, string>();
+        for (const [val, refStr] of Object.entries(disc.mapping)) {
+          const rn = typeof refStr === "string" ? refName(refStr) : undefined;
+          if (rn) mapRefNameToLabel.set(rn, toValidModuleName(val));
+        }
+      }
+      if (allRefs) {
+        const seen = new Set<string>();
+        const cases: Array<{ label: string; payload?: TypeIR }> = [];
+        for (const m of unionMembers) {
+          if (!isRef(m)) continue;
+          const $ref = m.$ref;
+          const typeNm = refName($ref) ?? "unknown";
+          let inferred: string | undefined;
+          if (disc && disc.propertyName) {
+            const resolved = ctx.resolve<SchemaObject>($ref);
+            const propName = disc.propertyName;
+            if (resolved && typeof resolved === "object") {
+              let props: Record<string, SchemaLike> = {};
+      if ("properties" in resolved && resolved.properties) props = resolved.properties;
+              const ds = props ? props[propName] : undefined;
+              let dso: SchemaObject | undefined;
+              if (ds) dso = isRef(ds) ? ctx.resolve<SchemaObject>(ds.$ref) : ds;
+              const val = dso && typeof dso === "object" && ("const" in dso ? dso.const : Array.isArray(dso.enum) && dso.enum.length === 1 ? dso.enum[0] : undefined);
+              if (val !== undefined) inferred = toValidModuleName(String(val));
+            }
+          }
+          let label = mapRefNameToLabel?.get(typeNm) ?? inferred ?? toValidModuleName(typeNm);
+          let uniq = label;
+          let i = 2;
+          while (seen.has(uniq)) uniq = `${label}_${i++}`;
+          seen.add(uniq);
+          cases.push({ label: `#${uniq}`, payload: refIR(typeNm) });
+        }
+        const pv = polyIR(cases);
+        const wrapped = appIR(refIR("Wrapped.t"), [pv]);
+        return s.nullable ? appIR(refIR("Null.t"), [wrapped]) : wrapped;
+      }
+      // Mixed or inline members
+      const seen = new Set<string>();
+      const cases: Array<{ label: string; payload?: TypeIR }> = [];
+      unionMembers.forEach((m, idx) => {
+        if (isRef(m)) {
+          const $ref = m.$ref;
+          const typeNm = refName($ref) ?? "unknown";
+          let inferred: string | undefined;
+          if (disc && disc.propertyName) {
+            const resolved = ctx.resolve<SchemaObject>($ref);
+            const propName = disc.propertyName;
+            if (resolved && typeof resolved === "object") {
+              let props: Record<string, SchemaLike> = {};
+      if ("properties" in resolved && resolved.properties) props = resolved.properties;
+              const ds = props ? props[propName] : undefined;
+              let dso: SchemaObject | undefined;
+              if (ds) dso = isRef(ds) ? ctx.resolve<SchemaObject>(ds.$ref) : ds;
+              const val = dso && typeof dso === "object" && ("const" in dso ? dso.const : Array.isArray(dso.enum) && dso.enum.length === 1 ? dso.enum[0] : undefined);
+              if (val !== undefined) inferred = toValidModuleName(String(val));
+            }
+          }
+          let label = inferred ?? toValidModuleName(typeNm);
+          let uniq = label;
+          let k = 2;
+          while (seen.has(uniq)) uniq = `${label}_${k++}`;
+          seen.add(uniq);
+          cases.push({ label: `#${uniq}`, payload: refIR(typeNm) });
+        } else {
+          // Map member; hoist inline records to aux types
+          const ir = mapSchemaToIR(m, ctx, { parentName, collectAux, optionalAsOption });
+          let payload: TypeIR = ir;
+          if (ir.kind === "record" && typeof collectAux === "function") {
+            const printed = printTypeIR(ir);
+            const base = toValidTypeName(`${parentName ?? "t"}_member_${idx + 1}`);
+            const auxName = nameWithHash(base, printed);
+            collectAux(auxName, printed);
+            payload = refIR(auxName);
+          }
+          let inferred: string | undefined;
+          if (disc && disc.propertyName && m && typeof m === "object") {
+            const propName = disc.propertyName;
+            const mm = m;
+            let props: Record<string, SchemaLike> = {};
+            if ("properties" in mm && mm.properties) props = mm.properties;
+            const ds = props ? props[propName] : undefined;
+            let dso: SchemaObject | undefined;
+            if (ds) dso = isRef(ds) ? ctx.resolve<SchemaObject>(ds.$ref) : ds;
+            const val = dso && typeof dso === "object" && ("const" in dso ? dso.const : Array.isArray(dso.enum) && dso.enum.length === 1 ? dso.enum[0] : undefined);
+            if (val !== undefined) inferred = toValidModuleName(String(val));
+          }
+          let label = inferred ?? toValidModuleName(`Member${idx + 1}`);
+          let uniq = label;
+          let k2 = 2;
+          while (seen.has(uniq)) uniq = `${label}_${k2++}`;
+          seen.add(uniq);
+          cases.push({ label: `#${uniq}`, payload });
+        }
+      });
+      const pv = polyIR(cases);
+      const wrapped = appIR(refIR("Wrapped.t"), [pv]);
+      return s.nullable ? appIR(refIR("Null.t"), [wrapped]) : wrapped;
+    }
+    // Enums: strings/numbers → PV union via poly IR
+    if (Array.isArray(s.enum) && s.enum.length > 0) {
+      const vals = s.enum;
+      const allStrings = vals.every((v) => typeof v === "string");
+      const allNumbers = vals.every((v) => typeof v === "number");
+      if (allStrings || allNumbers) {
+        const sorted = [...vals].sort((a, b) => String(a).localeCompare(String(b)));
+        const label = (v: string): string => {
+          const isIdent = /^[A-Za-z_][A-Za-z0-9_]*$/.test(v);
+          const isReserved = RES_KEYWORDS.has(v);
+          return isIdent && !isReserved ? `#${v}` : `#${JSON.stringify(v)}`;
+        };
+        const cases = sorted.map((v) => ({ label: label(String(v)) }));
+        const pv = polyIR(cases);
+        if (s.nullable) return appIR(refIR("Null.t"), [pv]);
+        return pv;
+      }
+    }
+    if (hasDefs(s) && typeof collectAux === "function") {
+      for (const [k, v] of Object.entries(s.$defs)) {
+        const auxName = `${parentName ?? "t"}__def_${toValidTypeName(k)}`;
+        const ir = mapSchemaToIR(v, ctx, {
+          parentName: auxName,
+          collectAux,
+          optionalAsOption,
+        });
+        collectAux(auxName, printTypeIR(ir));
+      }
+    }
+    // Arrays
+    if (s && typeof s === "object" && s.type === "array" && s.items && !Array.isArray(s.items)) {
+      let inner = mapSchemaToIR(s.items, ctx, { parentName, collectAux, optionalAsOption });
+      if (inner.kind === "record" && typeof collectAux === "function") {
+        const printed = printTypeIR(inner);
+        const base = toValidTypeName(`${parentName ?? "t"}_item`);
+        const nm = nameWithHash(base, printed);
+        collectAux(nm, printed);
+        inner = refIR(nm);
+      }
+      let arrIR = appIR(refIR("array"), [inner]);
+      if (s.nullable) arrIR = appIR(refIR("Null.t"), [arrIR]);
+      return arrIR;
+    }
+    // Object-as-dict
+    if (
+      (s.type === "object" || "properties" in s || "additionalProperties" in s) &&
+      !("properties" in s && s.properties && Object.keys(s.properties ?? {}).length > 0)
+    ) {
+      // patternProperties → dict<JSON.t>
+      const patternProps = "patternProperties" in s ? s.patternProperties : undefined;
+      if (patternProps && typeof patternProps === "object" && Object.keys(patternProps).length > 0) {
+        const base = refIR("dict");
+        const out = appIR(base, [refIR("JSON.t")]);
+        return s.nullable ? appIR(refIR("Null.t"), [out]) : out;
+      }
+      // additionalProperties handling
+      if ("additionalProperties" in s && s.additionalProperties !== undefined) {
+        const ap = s.additionalProperties;
+        if (ap === true) {
+          const out = appIR(refIR("dict"), [refIR("JSON.t")]);
+          return s.nullable ? appIR(refIR("Null.t"), [out]) : out;
+        }
+        if (ap === false) {
+          return s.nullable ? appIR(refIR("Null.t"), [refIR("emptyObject")]) : refIR("emptyObject");
+        }
+        let inner = mapSchemaToIR(ap, ctx, { parentName, collectAux, optionalAsOption });
+        if (inner.kind === "record" && typeof collectAux === "function") {
+          const printed = printTypeIR(inner);
+          const base = toValidTypeName(`${parentName ?? "t"}_value`);
+          const nm = nameWithHash(base, printed);
+          collectAux(nm, printed);
+          inner = refIR(nm);
+        }
+        const out = appIR(refIR("dict"), [inner]);
+        return s.nullable ? appIR(refIR("Null.t"), [out]) : out;
+      }
+    }
+    // allOf → merge object-like members via IR; handle arrays/scalars via IR as well
+    if (Array.isArray(s.allOf) && s.allOf.length > 0) {
+      const tryInlineObject = (v: SchemaLike): SchemaObject | undefined => {
+        const node = isRef(v) ? ctx.resolve<SchemaObject>(v.$ref) : v;
+        if (!node) return undefined;
+        if (Array.isArray(node.allOf) && node.allOf.length > 0) {
+          for (const m of node.allOf) {
+            const obj = tryInlineObject(m);
+            if (obj) return obj;
+          }
+        }
+        if (node.type === "object" || "properties" in node || "additionalProperties" in node) return node;
+        return undefined;
+      };
+      const isAnnotationOnly = (node?: SchemaObject): boolean => {
+        if (!node || typeof node !== "object") return false;
+        const keys = Object.keys(node as Record<string, unknown>);
+        return keys.every((k) => ["title", "description", "deprecated", "readOnly", "writeOnly", "examples", "example"].includes(k));
+      };
+      const chooseNarrower = (aTy: string, bTy: string): "a" | "b" | undefined => {
+        if (aTy === bTy) return "a";
+        const isNullWrapped = (t: string): boolean => /^\s*Null\.t</.test(t);
+        const unwrapNull = (t: string): string => (isNullWrapped(t) ? t.replace(/^\s*Null\.t</, "").replace(/>\s*$/, "") : t);
+        const isArrayType = (t: string): { ok: true; inner: string } | { ok: false } => {
+          const m = t.trim().match(/^array<(.+)>$/);
+          return m ? { ok: true, inner: m[1]!.trim() } : { ok: false };
+        };
+        const isPVUnion = (t: string): boolean => /^\[\s*#/.test(t.trim());
+        const aNull = isNullWrapped(aTy);
+        const bNull = isNullWrapped(bTy);
+        if (aNull && !bNull) return "a";
+        if (bNull && !aNull) return "b";
+        const aArr = isArrayType(unwrapNull(aTy));
+        const bArr = isArrayType(unwrapNull(bTy));
+        if (aArr.ok && bArr.ok) {
+          const res = chooseNarrower(aArr.inner, bArr.inner);
+          return res ?? "a";
+        }
+        if ((aTy === "string" && isPVUnion(bTy)) || (aTy === "float" && isPVUnion(bTy))) return "b";
+        if ((bTy === "string" && isPVUnion(aTy)) || (bTy === "float" && isPVUnion(aTy))) return "a";
+        const prim = new Set(["string", "float", "bool", "unknown", "JSON.t"]);
+        const isAlias = (t: string): boolean => {
+          if (prim.has(t)) return false;
+          if (isPVUnion(t)) return false;
+          if (isArrayType(t).ok) return false;
+          return /^[A-Za-z_][A-Za-z0-9_]*$/.test(t.trim());
+        };
+        const aAlias = isAlias(aTy);
+        const bAlias = isAlias(bTy);
+        if (aAlias && !bAlias) return "a";
+        if (bAlias && !aAlias) return "b";
+        if (aAlias && bAlias) return "a";
+        return undefined;
+      };
+      const resolved: Array<SchemaObject | undefined> = s.allOf.map((m) => (isRef(m) ? ctx.resolve<SchemaObject>(m.$ref) : m));
+      const filtered = resolved.filter((r) => !isAnnotationOnly(r));
+      const topNullable = !!s.nullable || filtered.some((r) => !!r?.nullable);
+      const objectLikes = filtered.map((r) => (r ? tryInlineObject(r) : undefined)).filter((x): x is SchemaObject => Boolean(x));
+      if (objectLikes.length > 0) {
+        const required = new Set<string>();
+        type MergedProp = { ir: TypeIR; docs: string[]; conflicted?: boolean };
+        const merged = new Map<string, MergedProp>();
+        const order: string[] = [];
+        for (const obj of objectLikes) {
+          const req = Array.isArray(obj.required) ? obj.required : [];
+          for (const r of req) required.add(r);
+          const props: Record<string, SchemaLike> = "properties" in obj && obj.properties ? (obj.properties as Record<string, SchemaLike>) : {};
+          for (const [k, v] of Object.entries(props)) {
+            let ir = mapSchemaToIR(v, ctx, { parentName, collectAux, optionalAsOption });
+            ir = hoistFieldTypeIfNeeded(ir, collectAux, parentName, k);
+            const entry = merged.get(k);
+            const desc = (v as SchemaObject).description;
+            if (!entry) {
+              merged.set(k, { ir, docs: desc ? [desc] : [] });
+              order.push(k);
+            } else {
+              if (!alphaEq(entry.ir, ir)) {
+                const pref = chooseNarrowerIR(entry.ir, ir);
+                if (pref === "b") {
+                  entry.ir = ir;
+                  entry.conflicted = false;
+                } else if (pref === "a") {
+                  // keep existing
+                } else {
+                  // mark conflict, keep existing to remain conservative
+                  entry.conflicted = true;
+                }
+              }
+              if (desc) entry.docs.push(desc);
+            }
+          }
+        }
+        const fields: FieldIR[] = [];
+        const used = new Set<string>();
+        for (const propName of order) {
+          const ent = merged.get(propName)!;
+          let pIR = ent.ir;
+          const { rendered, attr } = toValidResFieldName(propName);
+          let name = rendered;
+          let i = 2;
+          while (used.has(name)) name = `${rendered}__${i++}`;
+          used.add(name);
+          const isReq = required.has(propName);
+          const field: FieldIR = { name, attr: attr ?? undefined, typ: pIR };
+          if (!isReq) {
+            if (optionalAsOption) {
+              const inner = unwrapNull(pIR);
+              if (inner) field.typ = appIR(refIR("Nullable.t"), [inner]);
+              else field.optional = "option";
+            } else {
+              field.optional = "questionMark";
+            }
+          }
+          const propDoc = ent.docs.filter(Boolean).join("\n");
+          const docParts: string[] = [];
+          if (propDoc.length > 0) docParts.push(propDoc);
+          if (ent.conflicted) docParts.push("TODO: allOf field type conflict; using first");
+          const combined = docParts.length > 0 ? wrapBlockDoc(docParts.join("\n")) : undefined;
+          if (combined) field.doc = combined;
+          fields.push(field);
+        }
+        const rec = recordIR(fields);
+        if (topNullable) {
+          if (typeof collectAux === "function") {
+            const printed = printTypeIR(rec);
+            const auxName = nameWithHash(toValidTypeName(`${parentName ?? "t"}__shape`), printed);
+            collectAux(auxName, printed);
+            return rawIR(`Null.t<${auxName}>`);
+          }
+          return appIR(refIR("Null.t"), [rec]);
+        }
+        return rec;
+      }
+      // Arrays/scalars handling via IR
+      const arrayMembers = filtered.filter((r) => r && r.type === "array" && r.items && !Array.isArray(r.items)) as Array<SchemaObject & ArraySubtype>;
+      if (arrayMembers.length > 0) {
+        const itemsIRs = arrayMembers.map((am) => mapSchemaToIR(am.items!, ctx, { parentName, collectAux, optionalAsOption }));
+        let chosen = itemsIRs[0]!;
+        let note: string | undefined;
+        for (let i = 1; i < itemsIRs.length; i++) {
+          if (!alphaEq(chosen, itemsIRs[i]!)) {
+            note = "TODO: allOf array items differ; using first";
+            break;
+          }
+        }
+        // Hoist inline records for items
+        if (chosen.kind === "record" && typeof collectAux === "function") {
+          const printed = printTypeIR(chosen);
+          const base = toValidTypeName(`${parentName ?? "t"}_item`);
+          const nm = nameWithHash(base, printed);
+          collectAux(nm, printed);
+          chosen = refIR(nm);
+        }
+        let arrIR: TypeIR = appIR(refIR("array"), [chosen]);
+        if (topNullable) arrIR = appIR(refIR("Null.t"), [arrIR]);
+        if (note) arrIR = withDoc(wrapBlockDoc(note), arrIR);
+        return arrIR;
+      }
+      // Scalars and enums
+      const enumSets: Array<{ kind: "string" | "number"; values: string[] }> = [];
+      for (const r of filtered) {
+        if (!r) continue;
+        if (Array.isArray(r.enum) && r.enum.length > 0) {
+          const allStrings = r.enum.every((v) => typeof v === "string");
+          const allNumbers = r.enum.every((v) => typeof v === "number");
+          if (allStrings) enumSets.push({ kind: "string", values: (r.enum as any[]).map((x) => String(x)) });
+          else if (allNumbers) enumSets.push({ kind: "number", values: (r.enum as any[]).map((x) => String(x)) });
+        }
+      }
+      if (enumSets.length > 0) {
+        const sameKind = enumSets.every((e) => e.kind === enumSets[0]!.kind);
+        if (sameKind) {
+          let inter = new Set(enumSets[0]!.values);
+          for (let i = 1; i < enumSets.length; i++) {
+            const cur = new Set(enumSets[i]!.values);
+            inter = new Set([...inter].filter((x) => cur.has(x)));
+          }
+          let pv: TypeIR;
+          let note: string | undefined;
+          if (inter.size > 0) {
+            const labels = [...inter].sort((a, b) => a.localeCompare(b)).map((v) => ({ label: pvLabelForValue(v) }));
+            pv = polyIR(labels);
+          } else {
+            const first = enumSets[0]!.values;
+            const labels = [...first].sort((a, b) => a.localeCompare(b)).map((v) => ({ label: pvLabelForValue(v) }));
+            pv = polyIR(labels);
+            note = "TODO: allOf enum intersection empty; using first";
+          }
+          let out: TypeIR = pv;
+          if (topNullable) out = appIR(refIR("Null.t"), [out]);
+          if (note) out = withDoc(wrapBlockDoc(note), out);
+          return out;
+        }
+      }
+      // Base primitives
+      const primOrder: Array<"string" | "number" | "integer" | "boolean"> = ["string", "number", "integer", "boolean"];
+      let chosenPrim: TypeIR | undefined;
+      let conflictNote: string | undefined;
+      let firstPrimKind: string | undefined;
+      for (const r of filtered) {
+        if (!r) continue;
+        const t = r.type;
+        if (t && (t === "string" || t === "number" || t === "integer" || t === "boolean")) {
+          if (!chosenPrim) {
+            firstPrimKind = t;
+            const mapped = t === "string" ? refIR("string") : t === "boolean" ? refIR("bool") : refIR("float");
+            chosenPrim = mapped;
+          } else if (firstPrimKind && t !== firstPrimKind) {
+            conflictNote = "TODO: allOf mixed scalars; using first";
+            break;
+          }
+        }
+      }
+      if (chosenPrim) {
+        let out: TypeIR = chosenPrim;
+        if (topNullable) out = appIR(refIR("Null.t"), [out]);
+        if (conflictNote) out = withDoc(wrapBlockDoc(conflictNote), out);
+        return out;
+      }
+      // Ref + wrapper (nullable) or annotation-only → pass-through ref
+      const refMembers = s.allOf.filter(isRef) as ReferenceObject[];
+      if (refMembers.length === 1 && filtered.length <= 1) {
+        let out: TypeIR = refIR(refName(refMembers[0]!.$ref) ?? "unknown");
+        if (topNullable) out = appIR(refIR("Null.t"), [out]);
+        return out;
+      }
+      // Fallback: rely on current string-based mapping
+      return rawIR(mapSchemaToRes(schema, ctx, { parentName, collectAux, optionalAsOption }));
+    }
+    // Only object-with-properties is handled structurally for now.
+    if (isObjectSchema(s)) {
+      let props: Record<string, SchemaLike> = {};
+      const required = new Set<string>(Array.isArray(s.required) ? s.required : []);
+      if ("properties" in s && s.properties) props = s.properties;
+      const propEntries = getEntries<SchemaLike>(props);
+      if (propEntries.length > 0) {
+        const used: Set<string> = new Set();
+        const fields: FieldIR[] = [];
+        for (const [propName, propSchema] of propEntries) {
+          // Build IR for the property type
+          let pIR = mapSchemaToIR(propSchema, ctx, { parentName, collectAux, optionalAsOption });
+          // Hoist inline records under wrappers or as direct property types to reduce nesting
+          pIR = hoistFieldTypeIfNeeded(pIR, collectAux, parentName, propName);
+          const { rendered, attr } = toValidResFieldName(propName);
+          let name = rendered;
+          let i = 2;
+          while (used.has(name)) name = `${rendered}__${i++}`;
+          used.add(name);
+          const isReq = required.has(propName);
+          const pdoc = wrapBlockDoc(propSchema.description);
+          // Optionality handling with IR: option vs Nullable
+          const field: FieldIR = { name, attr: attr ?? undefined, typ: pIR };
+          if (!isReq) {
+            if (optionalAsOption) {
+              const inner = unwrapNull(pIR);
+              if (inner) {
+                field.typ = appIR(refIR("Nullable.t"), [inner]);
+              } else {
+                field.optional = "option";
+              }
+            } else {
+              field.optional = "questionMark";
+            }
+          }
+          if (pdoc) field.doc = pdoc;
+          fields.push(field);
+        }
+        const recIR = recordIR(fields);
+        if (s.nullable) {
+          // Preserve hoisting behavior: avoid inline record inside Null.t by emitting an aux.
+          const printed = printTypeIR(recIR);
+          const auxName = nameWithHash(toValidTypeName(`${parentName ?? "t"}__shape`), printed);
+          if (typeof collectAux === "function") collectAux(auxName, printed);
+          return rawIR(`Null.t<${auxName}>`);
+        }
+        return recIR;
+      }
+    }
+  }
+  // Fallback: rely on the current string-based mapping
+  return rawIR(
+    mapSchemaToRes(schema, ctx, { parentName, collectAux, optionalAsOption })
+  );
+}
+
 function buildComponentsSchemas(
   components: ComponentsObject | undefined,
   ctx: RSContext
@@ -1133,7 +1800,7 @@ function buildComponentsSchemas(
           topDoc = topDoc ? `${topDoc}\n${line}` : line;
         }
       }
-      let body = mapSchemaToRes(schema, ctx, {
+      const bodyIR = mapSchemaToIR(schema, ctx, {
         parentName: typeName,
         collectAux: (n, b) => {
           const { doc, code } = splitDocBlock(b);
@@ -1141,8 +1808,9 @@ function buildComponentsSchemas(
         },
         optionalAsOption: true,
       });
+      const bodyPrinted = printTypeIR(bodyIR).trim();
       // Note: Final guard removed; hoisting must happen during traversal (stage 1)
-      if (body.trim() === "unknown") {
+      if (bodyPrinted === "unknown") {
         const extra = wrapBlockDoc(
           "TODO: unsupported or ambiguous schema; fell back to unknown"
         );
@@ -1153,7 +1821,7 @@ function buildComponentsSchemas(
       }
       const doc = wrapBlockDoc(topDoc);
       const kw: "type rec" | "and" = idx === 0 ? "type rec" : "and";
-      const firstBody: TypeIR = withDoc(doc, rawIR(body));
+      const firstBody: TypeIR = withDoc(doc, bodyIR);
       declNodes.push({ kind: "type", keyword: kw, name: typeName, body: firstBody });
       if (aux.length > 0) {
         const seen = new Set<string>();
@@ -1172,7 +1840,7 @@ function buildComponentsSchemas(
   const hdrs = components?.headers ?? {};
   const hdrEntries = Object.entries(hdrs);
   if (hdrEntries.length > 0) {
-    const fields: string[] = [];
+    const fields: FieldIR[] = [];
     for (const [name, headerLike] of hdrEntries) {
       const header: HeaderObject | undefined = isRef(headerLike)
         ? ctx.resolve<HeaderObject>(headerLike.$ref)
@@ -1195,14 +1863,20 @@ function buildComponentsSchemas(
         }
       }
       const fn = toValidResFieldName(name);
-      const field = `${fn.attr ?? ""}${fn.rendered}: option<string>,`;
+      const field: FieldIR = {
+        name: fn.rendered,
+        attr: fn.attr ?? undefined,
+        // Headers are optional in outputs → option<string>
+        typ: refIR("string"),
+        optional: "option",
+      };
       if (actual !== "string") {
         const doc = wrapBlockDoc(`actual: ${actual}`);
-        if (doc) fields.push(doc);
+        if (doc) field.doc = doc;
       }
       fields.push(field);
     }
-    const bodyIR = rawIR(`\n{\n${indentLines(fields, 2)}\n}`);
+    const bodyIR = recordIR(fields);
     headersItems.push({ kind: "type", keyword: "type", name: "response", body: bodyIR });
   } else {
     headersItems.push({ kind: "type", keyword: "type", name: "response", body: rawIR("emptyObject") });
@@ -1340,7 +2014,7 @@ function buildOperations(
         if (Array.isArray(opParams)) allParams.push(...opParams);
 
         type GroupKey = "query" | "header" | "path" | "cookie";
-        const groups: Record<GroupKey, string[]> = { query: [], header: [], path: [], cookie: [] };
+        const groups: Record<GroupKey, FieldIR[]> = { query: [], header: [], path: [], cookie: [] };
         const paramAux: Array<TypeDeclIR> = [];
         const present: Set<GroupKey> = new Set();
         for (const pp of allParams) {
@@ -1365,10 +2039,15 @@ function buildOperations(
             });
           }
           const fname = toValidResFieldName(name);
-          const sep = required ? ": " : "?: ";
           const pdoc = wrapBlockDoc(param.description);
-          if (pdoc) groups[where].push(pdoc);
-          groups[where].push(`${fname.attr ?? ""}${fname.rendered}${sep}${ty},`);
+          const field: FieldIR = {
+            name: fname.rendered,
+            attr: fname.attr ?? undefined,
+            typ: rawIR(ty),
+            optional: required ? undefined : "questionMark",
+          };
+          if (pdoc) field.doc = pdoc;
+          groups[where].push(field);
           present.add(where);
         }
 
@@ -1384,17 +2063,21 @@ function buildOperations(
         for (const k of fieldOrder) {
           if (!present.has(k)) continue;
           const body = groups[k];
-          const typeBody = `\n{\n${indentLines(body, 2)}\n}`;
-          modItems.push({ kind: "type", keyword: "type", name: k, body: rawIR(typeBody) });
+          modItems.push({ kind: "type", keyword: "type", name: k, body: recordIR(body) });
         }
         if (present.size > 0) {
-          const paramsFields: string[] = [];
+          const paramsFields: FieldIR[] = [];
           for (const k of fieldOrder) {
             if (!present.has(k)) continue;
             const target = toValidResFieldName(k);
-            paramsFields.push(`${target.attr ?? ""}${target.rendered}?: ${k},`);
+            paramsFields.push({
+              name: target.rendered,
+              attr: target.attr ?? undefined,
+              typ: refIR(k),
+              optional: "questionMark",
+            });
           }
-          const paramsBody = rawIR(`\n{\n${indentLines(paramsFields, 2)}\n}`);
+          const paramsBody = recordIR(paramsFields);
           modItems.push({ kind: "type", keyword: "type", name: "params", body: paramsBody });
         }
 
@@ -1693,7 +2376,7 @@ function buildOperations(
           op.operationId && typeof op.operationId === "string" && op.operationId.length > 0
             ? op.operationId
             : `${String(p)}_${String(m)}`;
-        const callbacks = op.callbacks as Record<string, CallbackObject | ReferenceObject> | undefined;
+        const callbacks = op.callbacks;
         if (!callbacks) continue;
         for (const [cbName, cbVal] of Object.entries(callbacks)) {
           const cbResolved = cbVal && isRef(cbVal) ? ctx.resolve<CallbackObject>(cbVal.$ref) : cbVal;
@@ -1715,7 +2398,7 @@ function buildOperations(
               if (Array.isArray(opParams)) allParams.push(...opParams);
 
               type GroupKey = "query" | "header" | "path" | "cookie";
-              const groups: Record<GroupKey, string[]> = { query: [], header: [], path: [], cookie: [] };
+              const groups: Record<GroupKey, FieldIR[]> = { query: [], header: [], path: [], cookie: [] };
               const paramAux: Array<TypeDeclIR> = [];
               const present: Set<GroupKey> = new Set();
               for (const p2 of allParams) {
@@ -1739,8 +2422,13 @@ function buildOperations(
                   });
                 }
                 const fname = toValidResFieldName(name);
-                const sep = required ? ": " : "?: ";
-                groups[where].push(`${fname.attr ?? ""}${fname.rendered}${sep}${ty},`);
+                const field: FieldIR = {
+                  name: fname.rendered,
+                  attr: fname.attr ?? undefined,
+                  typ: rawIR(ty),
+                  optional: required ? undefined : "questionMark",
+                };
+                groups[where].push(field);
                 present.add(where);
               }
 
@@ -1751,17 +2439,21 @@ function buildOperations(
               for (const k of fieldOrder) {
                 if (!present.has(k)) continue;
                 const body = groups[k];
-                const typeBody = `\n{\n${indentLines(body, 2)}\n}`;
-                modItems.push({ kind: "type", keyword: "type", name: k, body: rawIR(typeBody) });
+                modItems.push({ kind: "type", keyword: "type", name: k, body: recordIR(body) });
               }
               if (present.size > 0) {
-                const paramsFields: string[] = [];
+                const paramsFields: FieldIR[] = [];
                 for (const k of fieldOrder) {
                   if (!present.has(k)) continue;
                   const target = toValidResFieldName(k);
-                  paramsFields.push(`${target.attr ?? ""}${target.rendered}?: ${k},`);
+                  paramsFields.push({
+                    name: target.rendered,
+                    attr: target.attr ?? undefined,
+                    typ: refIR(k),
+                    optional: "questionMark",
+                  });
                 }
-                const paramsBody = rawIR(`\n{\n${indentLines(paramsFields, 2)}\n}`);
+                const paramsBody = recordIR(paramsFields);
                 modItems.push({ kind: "type", keyword: "type", name: "params", body: paramsBody });
               }
 
@@ -1809,11 +2501,13 @@ function buildOperations(
               }
 
               // PARAMETERS wrapper
-              const parametersFields: string[] = [];
-              if (present.size > 0) parametersFields.push("params?: params,");
-              if (bodyType) parametersFields.push(`body?: ${bodyType},`);
+              const parametersFields: FieldIR[] = [];
+              if (present.size > 0)
+                parametersFields.push({ name: "params", typ: refIR("params"), optional: "questionMark" });
+              if (bodyType)
+                parametersFields.push({ name: "body", typ: rawIR(bodyType), optional: "questionMark" });
               if (parametersFields.length > 0) {
-                const pBody = rawIR(`\n{\n${indentLines(parametersFields, 2)}\n}`);
+                const pBody = recordIR(parametersFields);
                 modItems.push({ kind: "type", keyword: "type", name: "parameters", body: pBody });
               } else {
                 modItems.push({ kind: "type", keyword: "type", name: "parameters", body: rawIR("emptyObject") });
@@ -1821,10 +2515,10 @@ function buildOperations(
 
               // RESPONSES (callbacks)
               const responses = cbOp.responses;
-              const successVariants: string[] = [];
+              const successVariants: Array<{ label: string; payload: TypeIR; attr?: string }> = [];
               const successPayloadTypes: string[] = [];
               const successStatusCodes: string[] = [];
-              const errorVariants: string[] = [];
+              const errorVariants: Array<{ label: string; payload: TypeIR; attr?: string }> = [];
               const auxTypes: Array<TypeDeclIR> = [];
               const successAuxTypes: Array<TypeDeclIR> = [];
               const usedSuccessCtors: Set<string> = new Set();
@@ -1869,9 +2563,8 @@ function buildOperations(
                   const headersVal = resp.headers;
                   const headerTypeName = toValidTypeName(`status_${status === "default" ? "default" : status}_headers`);
                   if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
-                    let headerBody: string;
                     if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
-                      const fields: string[] = [];
+                      const fields: FieldIR[] = [];
                       for (const [hname, hlike] of Object.entries(headersVal)) {
                         const header: HeaderObject | undefined = isRef(hlike) ? ctx.resolve<HeaderObject>(hlike.$ref) : hlike;
                         let actual: string = "string";
@@ -1887,17 +2580,22 @@ function buildOperations(
                           }
                         }
                         const fn = toValidResFieldName(hname);
+                        const field: FieldIR = {
+                          name: fn.rendered,
+                          attr: fn.attr ?? undefined,
+                          typ: refIR("string"),
+                          optional: "option",
+                        };
                         if (actual !== "string") {
                           const doc = wrapBlockDoc(`actual: ${actual}`);
-                          if (doc) fields.push(doc);
+                          if (doc) field.doc = doc;
                         }
-                        fields.push(`${fn.attr ?? ""}${fn.rendered}: option<string>,`);
+                        fields.push(field);
                       }
-                      headerBody = `\n{\n${indentLines(fields, 2)}\n}`;
+                      headerTypeDefs.push({ name: headerTypeName, body: recordIR(fields) });
                     } else {
-                      headerBody = `emptyObject`;
+                      headerTypeDefs.push({ name: headerTypeName, body: rawIR(`emptyObject`) });
                     }
-                    headerTypeDefs.push({ name: headerTypeName, body: rawIR(headerBody) });
                   }
 
                   const ctorBase = refNameForCtor ?? "Data";
@@ -1925,8 +2623,8 @@ function buildOperations(
                       successAuxTypes.push({ name: auxName, body: withDoc(doc, rawIR("unit")) });
                       payload = auxName;
                     }
-                    const variant = `${asAttr ?? ""}${c}({data: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
-                    successVariants.push(variant);
+                    const pay = rawIR(`{data: ${payload}, response: Response.t, headers: ${headerTypeName}}`);
+                    successVariants.push({ label: c, payload: pay, attr: asAttr });
                     successPayloadTypes.push(payload);
                     successStatusCodes.push(status);
                   } else {
@@ -1944,8 +2642,8 @@ function buildOperations(
                       auxTypes.push({ name: auxName, body: rawIR(payload) });
                       payload = auxName;
                     }
-                    const variant = `${asAttr ?? ""}${c}({error: ${payload}, response: Response.t, headers: ${headerTypeName}})`;
-                    errorVariants.push(variant);
+                    const pay = rawIR(`{error: ${payload}, response: Response.t, headers: ${headerTypeName}}`);
+                    errorVariants.push({ label: c, payload: pay, attr: asAttr });
                   }
                 }
 
@@ -1958,23 +2656,25 @@ function buildOperations(
                 if (successStatusCodes.length > 0) {
                   const uniq = Array.from(new Set(successStatusCodes));
                   const sorted = uniq.sort((a, b) => Number(a) - Number(b));
-                  const pv = sorted.map((s) => `#${s}`).join(" | ");
-                  modItems.push({ kind: "type", keyword: "type", name: "status", body: rawIR(`[${pv}]`) });
+                  const cases = sorted.map((s) => ({ label: `#${s}` }));
+                  modItems.push({ kind: "type", keyword: "type", name: "status", body: polyIR(cases) });
                 }
                 if (successAuxTypes.length > 0) {
                   for (const t of successAuxTypes) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
                 }
                 if (successVariants.length >= 1) {
-                  const body = successVariants.map((v) => `| ${v}`).join("\n  ");
                   modItems.push({ kind: "attr", code: '@tag("status")' });
-                  modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR(body) });
+                  const cases = successVariants.map((v) => ({ label: `#${v.label.startsWith("#") ? v.label.slice(1) : v.label}`.slice(1), payload: v.payload, attr: v.attr }));
+                  // Above mapping mistakenly adds '#'—but constructors are not prefixed with '#'. Keep label as-is.
+                  const cases2 = successVariants.map((v) => ({ label: v.label, payload: v.payload, attr: v.attr }));
+                  modItems.push({ kind: "type", keyword: "type", name: "success", body: adtIR(cases2) });
                 } else {
                   modItems.push({ kind: "type", keyword: "type", name: "success", body: rawIR("unknown") });
                 }
                 if (errorVariants.length > 0) {
-                  const body = errorVariants.map((v) => `| ${v}`).join("\n  ");
                   modItems.push({ kind: "attr", code: '@tag("status")' });
-                  modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR(body) });
+                  const cases = errorVariants.map((v) => ({ label: v.label, payload: v.payload, attr: v.attr }));
+                  modItems.push({ kind: "type", keyword: "type", name: "error", body: adtIR(cases) });
                 } else {
                   modItems.push({ kind: "type", keyword: "type", name: "error", body: rawIR("unknown") });
                 }
@@ -2041,15 +2741,15 @@ function buildPaths(
   for (const pe of pathEntries) {
     if (pe.entries.length === 0) continue;
     const typeName = typeNameForPath(pe);
-    const fields: string[] = [];
+    const fields: FieldIR[] = [];
     for (const e of pe.entries) {
       const mod = toValidModuleName(e.opId);
       const fnType = `fetchFn<Operations.${mod}.parameters, Operations.${mod}.success, Operations.${mod}.error>`;
       const target = toValidResFieldName(e.method);
       const asAttr = `@as(${JSON.stringify(e.method.toUpperCase())}) `;
-      fields.push(`${asAttr}${target.rendered}: ${fnType},`);
+      fields.push({ name: target.rendered, attr: asAttr, typ: rawIR(fnType) });
     }
-    nodes.push({ kind: "type", keyword: "type", name: typeName, body: rawIR(`\n{\n${indentLines(fields, 2)}\n}`) });
+    nodes.push({ kind: "type", keyword: "type", name: typeName, body: recordIR(fields) });
     nodes.push({ kind: "blank" });
     clientFields.push(`${JSON.stringify(pe.path)}: ${typeName},`);
   }
@@ -2098,15 +2798,15 @@ function buildWebhooks(
 
   for (const he of hookEntries) {
     if (he.entries.length === 0) continue;
-    const fields: string[] = [];
+    const fields: FieldIR[] = [];
     for (const e of he.entries) {
       const mod = toValidModuleName(e.opId);
       const fnType = `fetchFn<Operations.${mod}.parameters, Operations.${mod}.success, Operations.${mod}.error>`;
       const target = toValidResFieldName(e.method);
       const asAttr = `@as(${JSON.stringify(e.method.toUpperCase())}) `;
-      fields.push(`${asAttr}${target.rendered}: ${fnType},`);
+      fields.push({ name: target.rendered, attr: asAttr, typ: rawIR(fnType) });
     }
-    nodes.push({ kind: "type", keyword: "type", name: toValidTypeName(`${he.name}_webhook`), body: rawIR(`\n{\n${indentLines(fields, 2)}\n}`) });
+    nodes.push({ kind: "type", keyword: "type", name: toValidTypeName(`${he.name}_webhook`), body: recordIR(fields) });
     nodes.push({ kind: "blank" });
   }
 
