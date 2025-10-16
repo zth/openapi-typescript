@@ -61,7 +61,15 @@ export function sanitizeIdent(base: string): string {
   if (!base) return "_";
   let out = base
     .split("")
-    .map((c, i) => (i === 0 ? (/[A-Za-z_]/.test(c) ? c : "_") : /[A-Za-z0-9_]/.test(c) ? c : "_"))
+    .map((c, i) =>
+      i === 0
+        ? /[A-Za-z_]/.test(c)
+          ? c
+          : "_"
+        : /[A-Za-z0-9_]/.test(c)
+          ? c
+          : "_"
+    )
     .join("");
   out = out.replace(/_+/g, "_");
   return out;
@@ -76,7 +84,10 @@ export function toValidTypeName(name: string): string {
   return out;
 }
 
-export function toValidResFieldName(name: string): { rendered: string; attr?: string } {
+export function toValidResFieldName(name: string): {
+  rendered: string;
+  attr?: string;
+} {
   const raw = /^[0-9]+$/.test(name) ? `s${name}` : sanitizeIdent(name);
   const sanitized = raw.length > 0 ? raw[0]!.toLowerCase() + raw.slice(1) : raw;
   const reserved = RES_KEYWORDS.has(sanitized);
@@ -106,7 +117,8 @@ export type RSContext = {
   alphabetize: boolean;
   excludeDeprecated: boolean;
   silent: boolean;
-  resolve: (ref: string) => any;
+  /** Resolve a $ref to a concrete value, if possible */
+  resolve: <T = unknown>(ref: string) => T | undefined;
 };
 
 export type SchemaLike = SchemaObject | ReferenceObject;

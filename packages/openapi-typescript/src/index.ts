@@ -5,6 +5,7 @@ import type ts from "typescript";
 import { validateAndBundle } from "./lib/redoc.js";
 import { debug, resolveRef, scanDiscriminators } from "./lib/utils.js";
 import transformSchema from "./transform/index.js";
+import type { RSContext } from "./rescript/utils.js";
 import type { GlobalContext, OpenAPI3, OpenAPITSOptions } from "./types.js";
 
 export * from "./lib/ts.js";
@@ -43,10 +44,12 @@ export const COMMENT_HEADER = `/**
  */
 export default async function openapiTS(
   source: string | URL | OpenAPI3 | Buffer | Readable,
-  options: OpenAPITSOptions = {} as Partial<OpenAPITSOptions>,
+  options: OpenAPITSOptions = {} as Partial<OpenAPITSOptions>
 ): Promise<ts.Node[]> {
   if (!source) {
-    throw new Error("Empty schema. Please specify a URL, file path, or Redocly Config");
+    throw new Error(
+      "Empty schema. Please specify a URL, file path, or Redocly Config"
+    );
   }
 
   const redoc =
@@ -57,12 +60,15 @@ export default async function openapiTS(
           "operation-operationId-unique": { severity: "error" }, // throw error on duplicate operationIDs
         },
       },
-      { extends: ["minimal"] },
+      { extends: ["minimal"] }
     ));
 
   const schema = await validateAndBundle(source, {
     redoc,
-    cwd: options.cwd instanceof URL ? options.cwd : new URL(`file://${options.cwd ?? process.cwd()}/`),
+    cwd:
+      options.cwd instanceof URL
+        ? options.cwd
+        : new URL(`file://${options.cwd ?? process.cwd()}/`),
     silent: options.silent ?? false,
   });
 
@@ -83,12 +89,16 @@ export default async function openapiTS(
     rootTypesNoSchemaPrefix: options.rootTypesNoSchemaPrefix ?? false,
     injectFooter: [],
     pathParamsAsTypes: options.pathParamsAsTypes ?? false,
-    postTransform: typeof options.postTransform === "function" ? options.postTransform : undefined,
+    postTransform:
+      typeof options.postTransform === "function"
+        ? options.postTransform
+        : undefined,
     propertiesRequiredByDefault: options.propertiesRequiredByDefault ?? false,
     redoc,
     silent: options.silent ?? false,
     inject: options.inject ?? undefined,
-    transform: typeof options.transform === "function" ? options.transform : undefined,
+    transform:
+      typeof options.transform === "function" ? options.transform : undefined,
     makePathsEnum: options.makePathsEnum ?? false,
     generatePathParams: options.generatePathParams ?? false,
     resolve($ref) {
@@ -98,7 +108,11 @@ export default async function openapiTS(
 
   const transformT = performance.now();
   const result = transformSchema(schema, ctx);
-  debug("Completed AST transformation for entire document", "ts", performance.now() - transformT);
+  debug(
+    "Completed AST transformation for entire document",
+    "ts",
+    performance.now() - transformT
+  );
 
   return result;
 }
@@ -106,10 +120,12 @@ export default async function openapiTS(
 // ReScript emitter (experimental): Convert an OpenAPI schema directly to a ReScript string
 export async function openapiRS(
   source: string | URL | OpenAPI3 | Buffer | Readable,
-  options: OpenAPITSOptions = {} as Partial<OpenAPITSOptions>,
+  options: OpenAPITSOptions = {} as Partial<OpenAPITSOptions>
 ): Promise<string> {
   if (!source) {
-    throw new Error("Empty schema. Please specify a URL, file path, or Redocly Config");
+    throw new Error(
+      "Empty schema. Please specify a URL, file path, or Redocly Config"
+    );
   }
 
   const redoc =
@@ -120,23 +136,27 @@ export async function openapiRS(
           "operation-operationId-unique": { severity: "error" },
         },
       },
-      { extends: ["minimal"] },
+      { extends: ["minimal"] }
     ));
 
   const schema = await validateAndBundle(source, {
     redoc,
-    cwd: options.cwd instanceof URL ? options.cwd : new URL(`file://${options.cwd ?? process.cwd()}/`),
+    cwd:
+      options.cwd instanceof URL
+        ? options.cwd
+        : new URL(`file://${options.cwd ?? process.cwd()}/`),
     silent: options.silent ?? false,
   });
 
-  const ctx = {
+  const ctx: RSContext = {
     alphabetize: options.alphabetize ?? false,
     excludeDeprecated: options.excludeDeprecated ?? false,
     silent: options.silent ?? false,
-    resolve($ref: string) {
-      return resolveRef(schema, $ref, { silent: options.silent ?? false });
-    },
-  } as const;
+    resolve: <T = unknown>($ref: string) =>
+      resolveRef(schema, $ref, { silent: options.silent ?? false }) as
+        | T
+        | undefined,
+  };
 
   const { emitReScript } = await import("./rescript/index.js");
   return emitReScript(schema, ctx);
