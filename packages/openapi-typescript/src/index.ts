@@ -152,6 +152,15 @@ export async function openapiRS(
     alphabetize: options.alphabetize ?? false,
     excludeDeprecated: options.excludeDeprecated ?? false,
     silent: options.silent ?? false,
+    rsIncludeEnabled: options.rsInclude != null,
+    includePaths:
+      options.rsInclude && Array.isArray(options.rsInclude.paths)
+        ? new Set(options.rsInclude.paths)
+        : undefined,
+    explicitSchemas:
+      options.rsInclude && options.rsInclude.components && Array.isArray(options.rsInclude.components.schemas)
+        ? new Set(options.rsInclude.components.schemas)
+        : undefined,
     resolve: <T = unknown>($ref: string) =>
       resolveRef(schema, $ref, { silent: options.silent ?? false }) as
         | T

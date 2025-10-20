@@ -673,6 +673,15 @@ export interface OpenAPITSOptions {
   makePathsEnum?: boolean;
   /** Generate path params based on path even if they are not defiend in the open api schema */
   generatePathParams?: boolean;
+  /**
+   * ReScript-only: selectively include parts of the schema in the generated output.
+   * - When undefined: emit everything (current behavior).
+   * - When defined: filter by provided paths and/or component schema names.
+   */
+  rsInclude?: {
+    paths?: string[];
+    components?: { schemas?: string[] };
+  };
 }
 
 /** Context passed to all submodules */

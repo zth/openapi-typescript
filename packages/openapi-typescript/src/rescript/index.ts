@@ -32,6 +32,185 @@ import type { RSNode, TypeIR, FieldIR } from "./ir.js";
 import { raw as rawIR, withDoc, ref as refIR, app as appIR, record as recordIR, poly as polyIR, adt as adtIR } from "./ir.js";
 import { printFile, printTypeIR } from "./printer.js";
 
+// --- rsInclude support: dependency walker and selection helpers ---
+function isSchemaRefToComponent(ref: string): { ok: true; name: string } | { ok: false } {
+  const m = ref.match(/#\/components\/schemas\/([^/#]+)$/);
+  return m ? { ok: true, name: m[1]! } : { ok: false };
+}
+
+function collectSchemaRefs(schema: SchemaLike | undefined, ctx: RSContext, add: (name: string) => void, seen: Set<object>): void {
+  if (!schema) return;
+  if (isRef(schema)) {
+    const r = schema.$ref;
+    const mm = typeof r === "string" ? isSchemaRefToComponent(r) : { ok: false } as const;
+    if (mm.ok) add(mm.name);
+    const resolved = ctx.resolve<SchemaObject>(r as string);
+    if (resolved && typeof resolved === "object") collectSchemaRefs(resolved, ctx, add, seen);
+    return;
+  }
+  const s = schema as SchemaObject;
+  if (!s || typeof s !== "object") return;
+  if (seen.has(s as object)) return;
+  seen.add(s as object);
+  // composition
+  if (Array.isArray((s as any).allOf)) (s as any).allOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+  if (Array.isArray((s as any).oneOf)) (s as any).oneOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+  if (Array.isArray((s as any).anyOf)) (s as any).anyOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+  if ((s as any).not) collectSchemaRefs((s as any).not, ctx, add, seen);
+  // arrays / tuples
+  const items = (s as any).items;
+  if (items) {
+    if (Array.isArray(items)) items.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+    else collectSchemaRefs(items as SchemaLike, ctx, add, seen);
+  }
+  const prefixItems = (s as any).prefixItems;
+  if (Array.isArray(prefixItems)) prefixItems.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+  // objects
+  const props = (s as any).properties as Record<string, SchemaLike> | undefined;
+  if (props && typeof props === "object")
+    for (const v of Object.values(props)) collectSchemaRefs(v, ctx, add, seen);
+  const addl = (s as any).additionalProperties as boolean | SchemaLike | undefined;
+  if (addl && typeof addl === "object") collectSchemaRefs(addl as SchemaLike, ctx, add, seen);
+  const patt = (s as any).patternProperties as Record<string, SchemaLike> | undefined;
+  if (patt && typeof patt === "object") for (const v of Object.values(patt)) collectSchemaRefs(v, ctx, add, seen);
+  // conditional
+  if ((s as any).if) collectSchemaRefs((s as any).if, ctx, add, seen);
+  if ((s as any).then) collectSchemaRefs((s as any).then, ctx, add, seen);
+  if ((s as any).else) collectSchemaRefs((s as any).else, ctx, add, seen);
+}
+
+function collectFromParameter(param: import("../types.js").ParameterObject | undefined, ctx: RSContext, add: (name: string) => void, seen: Set<object>) {
+  if (!param) return;
+  if (param.schema) collectSchemaRefs(param.schema as SchemaLike, ctx, add, seen);
+  if (param.content && typeof param.content === "object") {
+    for (const mt of Object.values(param.content)) {
+      const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
+      if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
+        collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+    }
+  }
+}
+
+function collectFromOperation(op: OperationObject | undefined, ctx: RSContext, add: (name: string) => void, seen: Set<object>) {
+  if (!op) return;
+  // parameters
+  const opParams = op.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
+  if (Array.isArray(opParams)) {
+    for (const p of opParams) {
+      const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : (p as any);
+      if (pr) collectFromParameter(pr, ctx, add, seen);
+    }
+  }
+  // request body
+  const rb = op.requestBody;
+  if (rb) {
+    const req = isRef(rb) ? ctx.resolve<RequestBodyObject>(rb.$ref) : (rb as any);
+    const content = req && (req as any).content && typeof (req as any).content === "object" ? (req as any).content : undefined;
+    if (content) {
+      for (const mt of Object.values(content)) {
+        const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
+        if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
+          collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+      }
+    }
+  }
+  // responses (all statuses and default)
+  const resps = op.responses as import("../types.js").ResponsesObject | undefined;
+  if (resps && typeof resps === "object") {
+    for (const rv of Object.values(resps)) {
+      const resp = isRef(rv as any) ? ctx.resolve<ResponseObject>((rv as any).$ref) : (rv as any);
+      if (!resp || typeof resp !== "object") continue;
+      // content
+      const content = (resp as any).content;
+      if (content && typeof content === "object") {
+        for (const mt of Object.values(content)) {
+          const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
+          if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
+            collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+        }
+      }
+      // headers (schemas or content)
+      const headers = (resp as any).headers;
+      if (headers && typeof headers === "object") {
+        for (const h of Object.values(headers as Record<string, HeaderObject | ReferenceObject>)) {
+          const hdr = isRef(h as any) ? ctx.resolve<HeaderObject>((h as any).$ref) : (h as any);
+          if (!hdr || typeof hdr !== "object") continue;
+          if ((hdr as any).schema) collectSchemaRefs((hdr as any).schema, ctx, add, seen);
+          const hContent = (hdr as any).content;
+          if (hContent && typeof hContent === "object") {
+            for (const mt of Object.values(hContent as Record<string, import("../types.js").MediaTypeObject | ReferenceObject>)) {
+              const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
+              if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
+                collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+            }
+          }
+        }
+      }
+    }
+  }
+  // callbacks under this operation
+  const cbs = op.callbacks as Record<string, CallbackObject | ReferenceObject> | undefined;
+  if (cbs && typeof cbs === "object") {
+    for (const cb of Object.values(cbs)) {
+      const cbResolved = isRef(cb as any) ? ctx.resolve<CallbackObject>((cb as any).$ref) : (cb as any);
+      if (!cbResolved || typeof cbResolved !== "object") continue;
+      for (const cbPathItemLike of Object.values(cbResolved)) {
+        const cbItem = isRef(cbPathItemLike as any)
+          ? ctx.resolve<PathItemObject>((cbPathItemLike as any).$ref)
+          : (cbPathItemLike as any);
+        if (!cbItem || typeof cbItem !== "object") continue;
+        // path-level params for callback
+        const cbParams = (cbItem as any).parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
+        if (Array.isArray(cbParams)) {
+          for (const p of cbParams) {
+            const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : (p as any);
+            if (pr) collectFromParameter(pr, ctx, add, seen);
+          }
+        }
+        const METHODS: (keyof PathItemObject)[] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+        for (const m of METHODS) {
+          const op2 = resolveOperation((cbItem as any)[m], ctx);
+          if (op2) collectFromOperation(op2, ctx, add, seen);
+        }
+      }
+    }
+  }
+}
+
+function computeSelectedSchemas(schema: OpenAPI3, ctx: RSContext): Set<string> | undefined {
+  const includePaths = ctx.includePaths;
+  const explicit = ctx.explicitSchemas;
+  const enabled = (!!includePaths && includePaths.size > 0) || (!!explicit && explicit.size > 0);
+  if (!enabled) return undefined;
+  const selected = new Set<string>();
+  const add = (name: string) => {
+    if (typeof name === "string" && name.length > 0) selected.add(name);
+  };
+  const seen = new Set<object>();
+  if (includePaths && schema.paths && typeof schema.paths === "object") {
+    for (const [p, item] of Object.entries(schema.paths)) {
+      if (!includePaths.has(p)) continue;
+      const pathItem = isRef(item) ? ctx.resolve<PathItemObject>((item as any).$ref) : (item as any);
+      if (!pathItem || typeof pathItem !== "object") continue;
+      // path-level params
+      const pathParams = (pathItem as any).parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
+      if (Array.isArray(pathParams)) {
+        for (const par of pathParams) {
+          const resolved = isRef(par) ? ctx.resolve<import("../types.js").ParameterObject>(par.$ref) : (par as any);
+          if (resolved) collectFromParameter(resolved, ctx, add, seen);
+        }
+      }
+      const METHODS: (keyof PathItemObject)[] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+      for (const m of METHODS) {
+        const op = resolveOperation((pathItem as any)[m], ctx);
+        if (op) collectFromOperation(op, ctx, add, seen);
+      }
+    }
+  }
+  if (explicit && explicit.size > 0) for (const nm of explicit) selected.add(nm);
+  return selected;
+}
+
 // Track component schema type names to qualify refs in Operations/Callbacks
 let COMPONENT_SCHEMA_NAMES: Set<string> = new Set();
 
@@ -1175,8 +1354,14 @@ function buildComponentsSchemas(
     const restore = CURRENT_AUX_SCOPE;
     CURRENT_AUX_SCOPE = { usedNames: new Set(initialUsed), nameToBody: new Map() };
     try {
-      entries.forEach(([name, schema], idx) => {
+      let emitted = 0;
+      entries.forEach(([name, schema]) => {
+      const kw: "type rec" | "and" = emitted === 0 ? "type rec" : "and";
       const typeName = toValidTypeName(name);
+      // rsInclude gating: if selection is enabled and this schema name is not selected, skip emitting this type
+      if (ctx.selectedSchemas && ctx.selectedSchemas.size >= 0 && !ctx.selectedSchemas.has(name)) {
+        return;
+      }
       const aux: Array<TypeDeclIR> = [];
       // Compose doc: include description + array constraints if present
       let topDoc = schema.description ?? undefined;
@@ -1259,9 +1444,9 @@ function buildComponentsSchemas(
             : extra.replace(/^\/\*\*|\*\/$/g, "").trim();
       }
       const doc = wrapBlockDoc(topDoc);
-      const kw: "type rec" | "and" = idx === 0 ? "type rec" : "and";
       const firstBody: TypeIR = withDoc(doc, bodyIR);
       declNodes.push({ kind: "type", keyword: kw, name: typeName, body: firstBody });
+      emitted++;
       if (aux.length > 0) {
         const seen = new Set<string>();
         for (const t of aux) {
@@ -1344,6 +1529,24 @@ export function emitReScript(schema: OpenAPI3, ctx: RSContext): string {
   file.push({ kind: "open", name: "OpenAPIFetch" });
   file.push({ kind: "blank" });
 
+  // rsInclude: compute selection and emit placeholder type when enabled
+  if (ctx.rsIncludeEnabled) {
+    const sel = computeSelectedSchemas(schema, ctx);
+    if (sel) ctx.selectedSchemas = sel;
+    const note = wrapBlockDoc(
+      [
+        "Placeholder for filtered out entities.",
+        "To generate these, configure rsInclude (paths and/or components.schemas)",
+        "so that the desired paths/schemas are included, or remove rsInclude",
+        "to emit the full schema.",
+      ].join("\n")
+    );
+    // Emit an abstract placeholder type with a doc comment
+    const decl = [note, "type not_generated"].filter(Boolean).join("\n");
+    file.push({ kind: "raw", code: decl });
+    file.push({ kind: "blank" });
+  }
+
   // Components
   file.push(buildComponentsSchemas(schema.components, ctx));
   // Operations (now via IR)
@@ -1421,10 +1624,12 @@ function buildOperations(
   ];
 
   const emitForContainer = (
-    container?: Record<string, PathItemObject | ReferenceObject> | undefined
+    container?: Record<string, PathItemObject | ReferenceObject> | undefined,
+    enforceIncludePaths: boolean = false
   ) => {
     if (!container) return;
     for (const [p, item] of Object.entries(container)) {
+      if (enforceIncludePaths && ctx.includePaths && !ctx.includePaths.has(p)) continue;
       for (const m of METHODS) {
         const op = isRef(item) ? undefined : resolveOperation(item[m], ctx);
         if (!op) continue;
@@ -1889,8 +2094,9 @@ function buildOperations(
     }
   };
 
-  emitForContainer(paths);
-  emitForContainer(webhooks);
+  emitForContainer(paths, true);
+  // When filtering by paths, skip top-level webhooks since they aren't tied to a path
+  emitForContainer(webhooks, !!ctx.includePaths && ctx.includePaths.size > 0);
 
   // Callback operation modules under Operations
   const emitCallbacks = (
@@ -1898,6 +2104,7 @@ function buildOperations(
   ) => {
     if (!container) return;
     for (const [p, item] of Object.entries(container)) {
+      if (ctx.includePaths && !ctx.includePaths.has(p)) continue;
       if (!item || typeof item !== "object") continue;
       for (const m of METHODS) {
         const op = "$ref" in item ? undefined : resolveOperation(item[m], ctx);
@@ -2331,6 +2538,11 @@ function buildPaths(
   const clientFields: string[] = [];
   for (const pe of pathEntries) {
     if (pe.entries.length === 0) continue;
+    if (ctx.includePaths && !ctx.includePaths.has(pe.path)) {
+      // Excluded path: client maps to not_generated
+      clientFields.push(`${JSON.stringify(pe.path)}: not_generated,`);
+      continue;
+    }
     const typeName = typeNameForPath(pe);
     const fields: FieldIR[] = [];
     for (const e of pe.entries) {
@@ -2358,6 +2570,10 @@ function buildWebhooks(
   webhooks: OpenAPI3["webhooks"] | undefined,
   ctx: RSContext
 ): { nodes: RSNode[] } {
+  // When filtering by paths, skip top-level webhooks (not associated with a specific path)
+  if (ctx.includePaths && ctx.includePaths.size > 0) {
+    return { nodes: [] };
+  }
   const nodes: RSNode[] = [];
   const METHODS: (keyof PathItemObject)[] = [
     "get",

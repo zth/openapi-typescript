@@ -119,6 +119,14 @@ export type RSContext = {
   silent: boolean;
   /** Resolve a $ref to a concrete value, if possible */
   resolve: <T = unknown>(ref: string) => T | undefined;
+  /** Optional: when provided, rsInclude filtering is enabled */
+  rsIncludeEnabled?: boolean;
+  /** Optional exact path includes (e.g., "/pets") */
+  includePaths?: Set<string>;
+  /** Optional explicit component schema names to include (raw keys under components.schemas) */
+  explicitSchemas?: Set<string>;
+  /** Computed transitive closure of component schema names to emit when filtering */
+  selectedSchemas?: Set<string>;
 };
 
 export type SchemaLike = SchemaObject | ReferenceObject;
