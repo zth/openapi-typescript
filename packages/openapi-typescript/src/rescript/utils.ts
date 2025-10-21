@@ -123,6 +123,8 @@ export type RSContext = {
   rsIncludeEnabled?: boolean;
   /** Optional exact path includes (e.g., "/pets") */
   includePaths?: Set<string>;
+  /** Optional path prefixes to include (e.g., "/v2/apps") */
+  includePathPrefixes?: Set<string>;
   /** Optional explicit component schema names to include (raw keys under components.schemas) */
   explicitSchemas?: Set<string>;
   /** Computed transitive closure of component schema names to emit when filtering */

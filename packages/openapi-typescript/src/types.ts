@@ -680,6 +680,8 @@ export interface OpenAPITSOptions {
    */
   rsInclude?: {
     paths?: string[];
+    /** Optional: include any path that starts with one of these prefixes */
+    pathPrefixes?: string[];
     components?: { schemas?: string[] };
   };
 }

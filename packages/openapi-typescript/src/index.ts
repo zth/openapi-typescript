@@ -157,6 +157,10 @@ export async function openapiRS(
       options.rsInclude && Array.isArray(options.rsInclude.paths)
         ? new Set(options.rsInclude.paths)
         : undefined,
+    includePathPrefixes:
+      options.rsInclude && Array.isArray((options.rsInclude as any).pathPrefixes)
+        ? new Set((options.rsInclude as any).pathPrefixes)
+        : undefined,
     explicitSchemas:
       options.rsInclude && options.rsInclude.components && Array.isArray(options.rsInclude.components.schemas)
         ? new Set(options.rsInclude.components.schemas)

@@ -177,19 +177,37 @@ function collectFromOperation(op: OperationObject | undefined, ctx: RSContext, a
   }
 }
 
+function pathIsIncluded(p: string, ctx: RSContext): boolean {
+  const exact = ctx.includePaths;
+  const prefixes = ctx.includePathPrefixes;
+  if (exact && exact.size > 0 && exact.has(p)) return true;
+  if (prefixes && prefixes.size > 0) {
+    for (const pref of prefixes) {
+      if (p === pref) return true;
+      if (pref.endsWith("/")) {
+        if (p.startsWith(pref)) return true;
+      } else {
+        if (p.startsWith(pref + "/")) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function computeSelectedSchemas(schema: OpenAPI3, ctx: RSContext): Set<string> | undefined {
   const includePaths = ctx.includePaths;
+  const includePrefixes = ctx.includePathPrefixes;
   const explicit = ctx.explicitSchemas;
-  const enabled = (!!includePaths && includePaths.size > 0) || (!!explicit && explicit.size > 0);
+  const enabled = (!!includePaths && includePaths.size > 0) || (!!includePrefixes && includePrefixes.size > 0) || (!!explicit && explicit.size > 0);
   if (!enabled) return undefined;
   const selected = new Set<string>();
   const add = (name: string) => {
     if (typeof name === "string" && name.length > 0) selected.add(name);
   };
   const seen = new Set<object>();
-  if (includePaths && schema.paths && typeof schema.paths === "object") {
+  if ((includePaths || includePrefixes) && schema.paths && typeof schema.paths === "object") {
     for (const [p, item] of Object.entries(schema.paths)) {
-      if (!includePaths.has(p)) continue;
+      if (!pathIsIncluded(p, ctx)) continue;
       const pathItem = isRef(item) ? ctx.resolve<PathItemObject>((item as any).$ref) : (item as any);
       if (!pathItem || typeof pathItem !== "object") continue;
       // path-level params
@@ -1629,7 +1647,7 @@ function buildOperations(
   ) => {
     if (!container) return;
     for (const [p, item] of Object.entries(container)) {
-      if (enforceIncludePaths && ctx.includePaths && !ctx.includePaths.has(p)) continue;
+      if (enforceIncludePaths && (ctx.includePaths || ctx.includePathPrefixes) && !pathIsIncluded(p, ctx)) continue;
       for (const m of METHODS) {
         const op = isRef(item) ? undefined : resolveOperation(item[m], ctx);
         if (!op) continue;
@@ -2096,7 +2114,7 @@ function buildOperations(
 
   emitForContainer(paths, true);
   // When filtering by paths, skip top-level webhooks since they aren't tied to a path
-  emitForContainer(webhooks, !!ctx.includePaths && ctx.includePaths.size > 0);
+  emitForContainer(webhooks, !!(ctx.includePaths && ctx.includePaths.size > 0) || !!(ctx.includePathPrefixes && ctx.includePathPrefixes.size > 0));
 
   // Callback operation modules under Operations
   const emitCallbacks = (
@@ -2538,10 +2556,12 @@ function buildPaths(
   const clientFields: string[] = [];
   for (const pe of pathEntries) {
     if (pe.entries.length === 0) continue;
-    if (ctx.includePaths && !ctx.includePaths.has(pe.path)) {
+    if ((ctx.includePaths && ctx.includePaths.size > 0) || (ctx.includePathPrefixes && ctx.includePathPrefixes.size > 0)) {
+      if (!pathIsIncluded(pe.path, ctx)) {
       // Excluded path: client maps to not_generated
-      clientFields.push(`${JSON.stringify(pe.path)}: not_generated,`);
-      continue;
+        clientFields.push(`${JSON.stringify(pe.path)}: not_generated,`);
+        continue;
+      }
     }
     const typeName = typeNameForPath(pe);
     const fields: FieldIR[] = [];
@@ -2571,7 +2591,7 @@ function buildWebhooks(
   ctx: RSContext
 ): { nodes: RSNode[] } {
   // When filtering by paths, skip top-level webhooks (not associated with a specific path)
-  if (ctx.includePaths && ctx.includePaths.size > 0) {
+  if ((ctx.includePaths && ctx.includePaths.size > 0) || (ctx.includePathPrefixes && ctx.includePathPrefixes.size > 0)) {
     return { nodes: [] };
   }
   const nodes: RSNode[] = [];
