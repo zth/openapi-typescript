@@ -315,6 +315,172 @@ function isRef(s: unknown): s is ReferenceObject {
   );
 }
 
+// --- Simple untagged union detection for outputs ---
+type SimpleUnionMember = {
+  schema: SchemaObject;
+  refName?: string;
+  // direct properties map and required set for detection
+  properties: Record<string, SchemaLike>;
+  required: Set<string>;
+  // literal markers (prop -> stringified literal)
+  literalMarkers: Map<string, string>;
+  // properties considered non-nullable
+  nonNullableProps: Set<string>;
+};
+
+type SimpleUnionDetection = {
+  ok: true;
+  // signals indexed by member position
+  signals: Array<
+    | { kind: "literal"; prop: string; value: string }
+    | { kind: "key"; prop: string }
+  >;
+  // suggested constructor labels per member (deduped)
+  labels: string[];
+  // whether Unknown(JSON.t) should be emitted for decoder no-match cases
+  allowUnknown: boolean;
+} | { ok: false; reason?: string };
+
+function toADTCtorLabel(base: string, used: Set<string>): string {
+  const pas = toValidModuleName(base);
+  let out = pas;
+  let i = 2;
+  while (used.has(out)) out = `${pas}_${i++}`;
+  used.add(out);
+  return out;
+}
+
+function resolveObjectLikeForDetection(node: SchemaLike, ctx: RSContext): SchemaObject | undefined {
+  const s: SchemaObject | undefined = isRef(node) ? ctx.resolve<SchemaObject>((node as any).$ref) : (node as any);
+  if (!s || typeof s !== "object") return undefined;
+  // Attempt to descend allOf to find an object-like member (first found)
+  const tryInlineObject = (v: SchemaLike | SchemaObject | undefined): SchemaObject | undefined => {
+    if (!v) return undefined;
+    const n = isRef(v) ? ctx.resolve<SchemaObject>(v.$ref) : (v as any);
+    if (!n) return undefined;
+    if (Array.isArray((n as any).allOf) && (n as any).allOf.length > 0) {
+      for (const m of (n as any).allOf as SchemaLike[]) {
+        const k = tryInlineObject(m);
+        if (k) return k;
+      }
+    }
+    if (isObjectSchema(n)) return n;
+    return undefined;
+  };
+  return tryInlineObject(s) ?? (isObjectSchema(s) ? s : undefined);
+}
+
+function collectMemberInfo(member: SchemaLike, ctx: RSContext): SimpleUnionMember | undefined {
+  const s = resolveObjectLikeForDetection(member, ctx);
+  if (!s) return undefined;
+  const refNm = isRef(member) ? refName(member.$ref) : undefined;
+  const props: Record<string, SchemaLike> = ("properties" in s && s.properties) ? (s.properties as Record<string, SchemaLike>) : {};
+  const requiredArr = Array.isArray((s as any).required) ? ((s as any).required as string[]) : [];
+  const required = new Set<string>(requiredArr);
+  const literalMarkers = new Map<string, string>();
+  const nonNullable = new Set<string>();
+  for (const [k, v] of Object.entries(props)) {
+    const node: SchemaObject | undefined = isRef(v) ? ctx.resolve<SchemaObject>((v as any).$ref) : (v as any);
+    if (!node) continue;
+    // literal marker
+    if (node && typeof node === "object") {
+      if (Object.prototype.hasOwnProperty.call(node as any, "const") && (node as any).const != null) {
+        literalMarkers.set(k, String((node as any).const));
+      } else if (Array.isArray((node as any).enum) && (node as any).enum.length === 1) {
+        const v0 = (node as any).enum[0];
+        if (typeof v0 === "string" || typeof v0 === "number") literalMarkers.set(k, String(v0));
+      }
+    }
+    // non-nullable detection: no explicit null and not nullable
+    let nullable = false;
+    if ((node as any).nullable === true) nullable = true;
+    if (Array.isArray((node as any).type) && (node as any).type.includes("null")) nullable = true;
+    if (Array.isArray((node as any).enum) && (node as any).enum.some((x: any) => x == null)) nullable = true;
+    if (!nullable) nonNullable.add(k);
+  }
+  return { schema: s, refName: refNm, properties: props, required, literalMarkers, nonNullableProps: nonNullable };
+}
+
+function detectSimpleUntaggedUnion(members: SchemaLike[], ctx: RSContext, discriminator?: DiscriminatorObject): SimpleUnionDetection {
+  // Check null members for allowUnknown
+  const isNullTypeSchema = (m: SchemaLike | SchemaObject): boolean => {
+    let mm: SchemaObject | undefined;
+    if (isRef(m)) mm = ctx.resolve<SchemaObject>((m as any).$ref);
+    else mm = m as any;
+    if (!mm) return false;
+    if ((mm as any).type === "null") return true;
+    if (Array.isArray((mm as any).type)) {
+      const arr = (mm as any).type as unknown[];
+      return arr.includes("null") && arr.filter((t) => t !== "null").length === 0;
+    }
+    if (Array.isArray((mm as any).enum)) return (mm as any).enum.length === 1 && (mm as any).enum[0] == null;
+    return false;
+  };
+  const nonNullMembers = members.filter((m) => !isNullTypeSchema(m));
+  if (nonNullMembers.length === 0) return { ok: false, reason: "only null members" };
+  const allowUnknown = nonNullMembers.length < members.length;
+  // Collect info
+  const info: SimpleUnionMember[] = [];
+  for (const m of nonNullMembers) {
+    const ent = collectMemberInfo(m, ctx);
+    if (!ent) return { ok: false, reason: "non-object member" };
+    info.push(ent);
+  }
+  // Gather key usage counts across members
+  const keyCounts = new Map<string, number>();
+  for (const ent of info) {
+    const keys = new Set<string>(Object.keys(ent.properties));
+    for (const k of keys) keyCounts.set(k, (keyCounts.get(k) ?? 0) + 1);
+  }
+  // Literal markers map: prop -> value -> count
+  const literalCounts = new Map<string, Map<string, number>>();
+  for (const ent of info) {
+    for (const [k, v] of ent.literalMarkers.entries()) {
+      const mm = literalCounts.get(k) ?? new Map<string, number>();
+      mm.set(v, (mm.get(v) ?? 0) + 1);
+      literalCounts.set(k, mm);
+    }
+  }
+  const signals: SimpleUnionDetection["signals"] = [];
+  const labels: string[] = [];
+  const used = new Set<string>();
+  for (const ent of info) {
+    // prefer discriminator mapping if present
+    let labelBase: string | undefined;
+    if (discriminator && typeof discriminator === "object" && (discriminator as any).propertyName) {
+      const prop = (discriminator as any).propertyName as string;
+      const ds = ent.properties[prop];
+      const dso: SchemaObject | undefined = ds ? (isRef(ds) ? ctx.resolve<SchemaObject>((ds as any).$ref) : (ds as any)) : undefined;
+      const val = dso && ("const" in (dso as any) ? (dso as any).const : Array.isArray((dso as any).enum) && (dso as any).enum.length === 1 ? (dso as any).enum[0] : undefined);
+      if (val !== undefined) labelBase = String(val);
+    }
+    // Choose signal: literal unique across members, or unique non-null key
+    let sig: SimpleUnionDetection["signals"][number] | undefined;
+    // literal unique
+    let litChoice: { prop: string; value: string } | undefined;
+    outer: for (const [k, v] of ent.literalMarkers.entries()) {
+      const mm = literalCounts.get(k);
+      if (mm && (mm.get(v) ?? 0) === 1) { litChoice = { prop: k, value: v }; break outer; }
+    }
+    if (litChoice) {
+      sig = { kind: "literal", prop: litChoice.prop, value: litChoice.value };
+      if (!labelBase) labelBase = litChoice.value;
+    } else {
+      // unique key (present only in this member) and non-nullable
+      const keys = Object.keys(ent.properties);
+      for (const k of keys) {
+        const count = keyCounts.get(k) ?? 0;
+        if (count === 1 && ent.nonNullableProps.has(k)) { sig = { kind: "key", prop: k }; if (!labelBase) labelBase = `Has${toValidModuleName(k)}`; break; }
+      }
+    }
+    if (!sig) return { ok: false, reason: "no discriminator signal" };
+    signals.push(sig);
+    if (!labelBase) labelBase = ent.refName ?? "Member";
+    labels.push(toADTCtorLabel(labelBase, used));
+  }
+  return { ok: true, signals, labels, allowUnknown };
+}
+
 function stripLastComma(lines: string[]): string[] {
   if (!Array.isArray(lines) || lines.length === 0) return lines;
   const out = [...lines];
@@ -1875,8 +2041,8 @@ function buildOperations(
 
         if (responses && typeof responses === "object") {
           // Collect success bodies
-          const bodies: { code: string; ty: string }[] = [];
-          for (const [status, respLike] of Object.entries(responses)) {
+      const bodies: { code: string; ty: string }[] = [];
+      for (const [status, respLike] of Object.entries(responses)) {
             const isDefault = status === "default";
             const n = parseInt(status, 10);
             const is2xx = !isNaN(n) && n >= 200 && n < 300;
@@ -1904,36 +2070,221 @@ function buildOperations(
               if (!chosen && entries.length === 1) chosen = entries[0]![1];
               if (chosen && chosen.schema) {
                 const base = toValidTypeName(`status_${status}_body`);
-                const auxLocal: Array<TypeDeclIR> = [];
-                let ir = mapSchemaToIR(chosen.schema, ctx, {
-                  parentName: base,
-                  collectAux: (n, b) => {
-                    const { doc, code } = splitDocBlock(b);
-                    auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                  },
-                  optionalAsOption: true,
-                  qualifyOpsRefs: true,
-                });
-                ir = hoistInlineRecordsIR(
-                  ir,
-                  (n, b) => {
-                    const { doc, code } = splitDocBlock(b);
-                    auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                  },
-                  base,
-                  true,
-                  undefined,
-                  /*qualify*/ true,
-                );
-                ir = qualifyComponentRefsIR(ir);
-                if (auxLocal.length > 0) {
-                  for (const t of auxLocal) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push(t);
-                }
-                if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
-                  if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
-                  payload = base;
+                const union = ((): SimpleUnionDetection | undefined => {
+                  const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any);
+                  if (!sch) return undefined;
+                  const members = (sch as any).oneOf ?? (sch as any).anyOf;
+                  if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                  return undefined;
+                })();
+
+                // If simple untagged union detected, emit ADT + alias + decoder and use alias as payload type
+                if (union && union.ok) {
+                  const adtName = toValidTypeName(`status_${status}_result_data`);
+                  const aliasName = toValidTypeName(`${adtName}_wrapped`);
+                  // Build payload types per member
+                  const cases: Array<{ label: string; payload: TypeIR }> = [];
+                  const auxLocal: Array<TypeDeclIR> = [];
+                  const members = ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).oneOf ?? ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).anyOf;
+                  for (let i = 0; i < (members as SchemaLike[]).length; i++) {
+                    const m = (members as SchemaLike[])[i]!;
+                    if (isRef(m)) {
+                      const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
+                      cases.push({ label: union.labels[i]!, payload: refIR(rn) });
+                    } else {
+                      const payloadBase = toValidTypeName(`${adtName}_${union.labels[i]}`);
+                      let irMem = mapSchemaToIR(m, ctx, {
+                        parentName: payloadBase,
+                        collectAux: (n, b) => {
+                          const { doc, code } = splitDocBlock(b);
+                          auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                        },
+                        optionalAsOption: true,
+                        qualifyOpsRefs: true,
+                      });
+                      irMem = hoistInlineRecordsIR(
+                        irMem,
+                        (n, b) => {
+                          const { doc, code } = splitDocBlock(b);
+                          auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                        },
+                        payloadBase,
+                        true,
+                        undefined,
+                        /*qualify*/ true,
+                      );
+                      irMem = qualifyComponentRefsIR(irMem);
+                      const printed = printTypeIR(irMem);
+                      const auxNm = nameWithHash(payloadBase, printed);
+                      auxLocal.push({ name: auxNm, body: irMem });
+                      cases.push({ label: union.labels[i]!, payload: refIR(auxNm) });
+                    }
+                  }
+                  if (auxLocal.length > 0) {
+                    for (const t of auxLocal) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                  }
+                  if (union.allowUnknown) {
+                    cases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
+                  }
+                  // Emit ADT next to aux types
+                  modItems.push({ kind: "attr", code: '@tag("kind")' });
+                  modItems.push({ kind: "type", keyword: "type", name: adtName, body: adtIR(cases) });
+                  // Alias wrapped with editor completion hint
+                  const decoderModName = `Decoder_${toValidModuleName(adtName)}`;
+                  const fullDecoderPath = `Operations.${mod}.${decoderModName}`;
+                  modItems.push({ kind: "raw", code: `@editor.completeFrom(${fullDecoderPath})\n type ${aliasName}` });
+                  // Decoder module built with UnionDecode helpers
+                  // Group signals to minimize calls: one chooseByKeys for all key signals,
+                  // and one chooseByLiteral per property for literal signals.
+                  type Step = { kind: "literal"; prop: string } | { kind: "keys" };
+                  const steps: Step[] = [];
+                  const seenLitProps = new Set<string>();
+                  const litMap = new Map<string, Array<{ value: string; label: string }>>();
+                  let sawKeys = false;
+                  const keyPairs: Array<{ prop: string; label: string }> = [];
+                  for (let i = 0; i < union.signals.length; i++) {
+                    const sig = union.signals[i]! as any;
+                    const label = union.labels[i]!;
+                    if (sig.kind === "literal") {
+                      const arr = litMap.get(sig.prop) ?? [];
+                      arr.push({ value: String(sig.value), label });
+                      litMap.set(sig.prop, arr);
+                      if (!seenLitProps.has(sig.prop)) {
+                        steps.push({ kind: "literal", prop: sig.prop });
+                        seenLitProps.add(sig.prop);
+                      }
+                    } else {
+                      keyPairs.push({ prop: sig.prop, label });
+                      if (!sawKeys) {
+                        steps.push({ kind: "keys" });
+                        sawKeys = true;
+                      }
+                    }
+                  }
+                  const buildTail = (kind: "throw" | "result"): string => {
+                    let tail = kind === "throw"
+                      ? (union.allowUnknown ? 'UnionDecode.make("Unknown", json)' : 'JsError.throwWithMessage("No matching union member")')
+                      : (union.allowUnknown ? 'Ok(UnionDecode.make("Unknown", json))' : 'Error(#DecodeError("No matching union member"))');
+                    for (let i = steps.length - 1; i >= 0; i--) {
+                      const st = steps[i]!;
+                      if (st.kind === "literal") {
+                        const arr = litMap.get(st.prop) ?? [];
+                        const parts = arr.map((p) => `${JSON.stringify(p.value)}: ${JSON.stringify(p.label)}`).join(", ");
+                        const mapLit = `dict{${parts}}`;
+                        const head = kind === "throw"
+                          ? `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => UnionDecode.make(l, json) | None => `
+                          : `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => Ok(UnionDecode.make(l, json)) | None => `;
+                        tail = `${head}${tail}}`;
+                      } else {
+                        const parts = keyPairs.map((p) => `${JSON.stringify(p.prop)}: ${JSON.stringify(p.label)}`).join(", ");
+                        const mapKey = `dict{${parts}}`;
+                        const head = kind === "throw"
+                          ? `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => UnionDecode.make(l, json) | None => `
+                          : `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => Ok(UnionDecode.make(l, json)) | None => `;
+                        tail = `${head}${tail}}`;
+                      }
+                    }
+                    return tail;
+                  };
+                  const buildTailOption = (): string => {
+                    let tail = union.allowUnknown
+                      ? 'Some(UnionDecode.make("Unknown", json))'
+                      : 'None';
+                    for (let i = steps.length - 1; i >= 0; i--) {
+                      const st = steps[i]!;
+                      if (st.kind === "literal") {
+                        const arr = litMap.get(st.prop) ?? [];
+                        const parts = arr.map((p) => `${JSON.stringify(p.value)}: ${JSON.stringify(p.label)}`).join(", ");
+                        const mapLit = `dict{${parts}}`;
+                        const head = `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => Some(UnionDecode.make(l, json)) | None => `;
+                        tail = `${head}${tail}}`;
+                      } else {
+                        const parts = keyPairs.map((p) => `${JSON.stringify(p.prop)}: ${JSON.stringify(p.label)}`).join(", ");
+                        const mapKey = `dict{${parts}}`;
+                        const head = `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => Some(UnionDecode.make(l, json)) | None => `;
+                        tail = `${head}${tail}}`;
+                      }
+                    }
+                    return tail;
+                  };
+                  const rsPrivate = [
+                    "%%private(",
+                    `let decode_: ${aliasName} => option<${adtName}> = json => {`,
+                    `  ${buildTailOption()}`,
+                    `}`,
+                    ")",
+                  ].join("\n");
+                  const rsThrow = [
+                    `let decodeOrThrow: ${aliasName} => ${adtName} = json => {`,
+                    `  switch decode_(json) {`,
+                    `  | Some(v) => v`,
+                    `  | None => JsError.throwWithMessage("No matching union member")`,
+                    `  }`,
+                    `}`,
+                  ].join("\n");
+                  const rsResult = [
+                    `let decode: ${aliasName} => result<${adtName}, [> #DecodeError(string)]> = json => {`,
+                    `  switch decode_(json) {`,
+                    `  | Some(v) => Ok(v)`,
+                    `  | None => Error(#DecodeError("No matching union member"))`,
+                    `  }`,
+                    `}`,
+                  ].join("\n");
+                  const decDoc = wrapBlockDoc(
+                    [
+                      "Decoder for simple untagged union.",
+                      "Matching signals:",
+                      ...union.signals.map((s, i) =>
+                        s.kind === "literal"
+                          ? `- ${union.labels[i]!}: ${s.prop} == ${s.value}`
+                          : `- ${union.labels[i]!}: has key ${s.prop}`
+                      ),
+                      union.allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
+                    ].join("\n")
+                  );
+                  if (decDoc) modItems.push({ kind: "raw", code: decDoc });
+                  modItems.push({ kind: "module", name: `Decoder_${toValidModuleName(adtName)}`, items: [
+                    { kind: "raw", code: rsPrivate },
+                    { kind: "raw", code: rsThrow },
+                    { kind: "raw", code: rsResult },
+                  ]});
+                  payload = aliasName;
+                } else if (union && !union.ok) {
+                  // Ambiguous untagged union → fallback to JSON.t
+                  payload = "JSON.t";
                 } else {
-                  payload = printTypeIR(ir);
+                  // Default IR path
+                  const auxLocal: Array<TypeDeclIR> = [];
+                  let ir = mapSchemaToIR(chosen.schema, ctx, {
+                    parentName: base,
+                    collectAux: (n, b) => {
+                      const { doc, code } = splitDocBlock(b);
+                      auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                    },
+                    optionalAsOption: true,
+                    qualifyOpsRefs: true,
+                  });
+                  ir = hoistInlineRecordsIR(
+                    ir,
+                    (n, b) => {
+                      const { doc, code } = splitDocBlock(b);
+                      auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                    },
+                    base,
+                    true,
+                    undefined,
+                    /*qualify*/ true,
+                  );
+                  ir = qualifyComponentRefsIR(ir);
+                  if (auxLocal.length > 0) {
+                    for (const t of auxLocal) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push(t);
+                  }
+                  if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
+                    if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                    payload = base;
+                  } else {
+                    payload = printTypeIR(ir);
+                  }
                 }
               } else {
                 payload = "unknown";
@@ -2315,35 +2666,201 @@ function buildOperations(
                     const chosen = chosenEntry?.[1];
                     if (chosen && chosen.schema) {
                       const base = toValidTypeName(`status_${status}_body`);
-                      const auxReq: Array<TypeDeclIR> = [];
-                      let ir = mapSchemaToIR(chosen.schema, ctx, {
-                        parentName: base,
-                        collectAux: (n, b) => {
-                          const { doc, code } = splitDocBlock(b);
-                          auxReq.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                        },
-                        optionalAsOption: true,
-                      });
-                      ir = hoistInlineRecordsIR(
-                        ir,
-                        (n, b) => {
-                          const { doc, code } = splitDocBlock(b);
-                          auxReq.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                        },
-                        base,
-                        true,
-                        undefined,
-                        /*qualify*/ true,
-                      );
-                      ir = qualifyComponentRefsIR(ir);
-                      if (auxReq.length > 0) {
-                        for (const t of auxReq) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push(t);
-                      }
-                      if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
-                        if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
-                        payload = base;
+                const union = ((): SimpleUnionDetection | undefined => {
+                        const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any);
+                        if (!sch) return undefined;
+                        const members = (sch as any).oneOf ?? (sch as any).anyOf;
+                        if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                        return undefined;
+                      })();
+                      if (union && union.ok) {
+                        const adtName = toValidTypeName(`status_${status}_result_data`);
+                        const aliasName = toValidTypeName(`${adtName}_wrapped`);
+                        const cases: Array<{ label: string; payload: TypeIR }> = [];
+                        const auxLocal: Array<TypeDeclIR> = [];
+                        const members = ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).oneOf ?? ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).anyOf;
+                        for (let i = 0; i < (members as SchemaLike[]).length; i++) {
+                          const m = (members as SchemaLike[])[i]!;
+                          if (isRef(m)) {
+                            const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
+                            cases.push({ label: union.labels[i]!, payload: refIR(rn) });
+                          } else {
+                            const payloadBase = toValidTypeName(`${adtName}_${union.labels[i]}`);
+                            let irMem = mapSchemaToIR(m, ctx, {
+                              parentName: payloadBase,
+                              collectAux: (n, b) => {
+                                const { doc, code } = splitDocBlock(b);
+                                auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                              },
+                              optionalAsOption: true,
+                            });
+                            irMem = hoistInlineRecordsIR(
+                              irMem,
+                              (n, b) => {
+                                const { doc, code } = splitDocBlock(b);
+                                auxLocal.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                              },
+                              payloadBase,
+                              true,
+                              undefined,
+                              /*qualify*/ true,
+                            );
+                            irMem = qualifyComponentRefsIR(irMem);
+                            const printed = printTypeIR(irMem);
+                            const auxNm = nameWithHash(payloadBase, printed);
+                            auxLocal.push({ name: auxNm, body: irMem });
+                            cases.push({ label: union.labels[i]!, payload: refIR(auxNm) });
+                          }
+                        }
+                        if (auxLocal.length > 0) {
+                          for (const t of auxLocal) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                        }
+                        if (union.allowUnknown) cases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
+                        modItems.push({ kind: "attr", code: '@tag("kind")' });
+                        modItems.push({ kind: "type", keyword: "type", name: adtName, body: adtIR(cases) });
+                        // Alias wrapped with editor completion hint
+                        const decoderModName2_forAlias = `Decoder_${toValidModuleName(adtName)}`;
+                        const fullDecoderPath2_forAlias = `Operations.${mod}.${decoderModName2_forAlias}`;
+                        modItems.push({ kind: "raw", code: `@editor.completeFrom(${fullDecoderPath2_forAlias})\n type ${aliasName}` });
+                        // Group signals (callbacks) same as above
+                        type Step2 = { kind: "literal"; prop: string } | { kind: "keys" };
+                        const steps2: Step2[] = [];
+                        const seenLit2 = new Set<string>();
+                        const litMap2 = new Map<string, Array<{ value: string; label: string }>>();
+                        let sawKeys2 = false;
+                        const keyPairs2: Array<{ prop: string; label: string }> = [];
+                        for (let i = 0; i < union.signals.length; i++) {
+                          const sig = union.signals[i]! as any;
+                          const label = union.labels[i]!;
+                          if (sig.kind === "literal") {
+                            const arr = litMap2.get(sig.prop) ?? [];
+                            arr.push({ value: String(sig.value), label });
+                            litMap2.set(sig.prop, arr);
+                            if (!seenLit2.has(sig.prop)) { steps2.push({ kind: "literal", prop: sig.prop }); seenLit2.add(sig.prop); }
+                          } else {
+                            keyPairs2.push({ prop: sig.prop, label });
+                            if (!sawKeys2) { steps2.push({ kind: "keys" }); sawKeys2 = true; }
+                          }
+                        }
+                        const buildTail2 = (kind: "throw" | "result"): string => {
+                          let tail2 = kind === "throw"
+                            ? (union.allowUnknown ? 'UnionDecode.make("Unknown", json)' : 'JsError.throwWithMessage("No matching union member")')
+                            : (union.allowUnknown ? 'Ok(UnionDecode.make("Unknown", json))' : 'Error(#DecodeError("No matching union member"))');
+                          for (let i = steps2.length - 1; i >= 0; i--) {
+                            const st = steps2[i]!;
+                            if (st.kind === "literal") {
+                              const arr = litMap2.get(st.prop) ?? [];
+                              const parts = arr.map((p) => `${JSON.stringify(p.value)}: ${JSON.stringify(p.label)}`).join(", ");
+                              const mapLit = `dict{${parts}}`;
+                              const head = kind === "throw"
+                                ? `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => UnionDecode.make(l, json) | None => `
+                                : `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => Ok(UnionDecode.make(l, json)) | None => `;
+                              tail2 = `${head}${tail2}}`;
+                            } else {
+                              const parts = keyPairs2.map((p) => `${JSON.stringify(p.prop)}: ${JSON.stringify(p.label)}`).join(", ");
+                              const mapKey = `dict{${parts}}`;
+                              const head = kind === "throw"
+                                ? `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => UnionDecode.make(l, json) | None => `
+                                : `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => Ok(UnionDecode.make(l, json)) | None => `;
+                              tail2 = `${head}${tail2}}`;
+                            }
+                          }
+                          return tail2;
+                        };
+                        const buildTailOpt2 = (): string => {
+                          let tail2 = union.allowUnknown
+                            ? 'Some(UnionDecode.make("Unknown", json))'
+                            : 'None';
+                          for (let i = steps2.length - 1; i >= 0; i--) {
+                            const st = steps2[i]!;
+                            if (st.kind === "literal") {
+                              const arr = litMap2.get(st.prop) ?? [];
+                              const parts = arr.map((p) => `${JSON.stringify(p.value)}: ${JSON.stringify(p.label)}`).join(", ");
+                              const mapLit = `dict{${parts}}`;
+                              const head = `switch UnionDecode.chooseByLiteral(json, ${JSON.stringify(st.prop)}, ${mapLit}) { | Some(l) => Some(UnionDecode.make(l, json)) | None => `;
+                              tail2 = `${head}${tail2}}`;
+                            } else {
+                              const parts = keyPairs2.map((p) => `${JSON.stringify(p.prop)}: ${JSON.stringify(p.label)}`).join(", ");
+                              const mapKey = `dict{${parts}}`;
+                              const head = `switch UnionDecode.chooseByKeys(json, ${mapKey}) { | Some(l) => Some(UnionDecode.make(l, json)) | None => `;
+                              tail2 = `${head}${tail2}}`;
+                            }
+                          }
+                          return tail2;
+                        };
+                        const decoderModName2 = `Decoder_${toValidModuleName(adtName)}`;
+                        const fullDecoderPath2 = `Operations.${mod}.${decoderModName2}`;
+                        const rsPriv2 = [
+                          "%%private(",
+                          `let decode_: ${aliasName} => option<${adtName}> = json => {`,
+                          `  ${buildTailOpt2()}`,
+                          `}`,
+                          ")",
+                        ].join("\n");
+                        const rsThrow2 = [
+                          `let decodeOrThrow: ${aliasName} => ${adtName} = json => {`,
+                          `  switch decode_(json) {`,
+                          `  | Some(v) => v`,
+                          `  | None => JsError.throwWithMessage("No matching union member")`,
+                          `  }`,
+                          `}`,
+                        ].join("\n");
+                        const rsRes2 = [
+                          `let decode: ${aliasName} => result<${adtName}, [> #DecodeError(string)]> = json => {`,
+                          `  switch decode_(json) {`,
+                          `  | Some(v) => Ok(v)`,
+                          `  | None => Error(#DecodeError("No matching union member"))`,
+                          `  }`,
+                          `}`,
+                        ].join("\n");
+                        const decDoc = wrapBlockDoc(
+                          [
+                            "Decoder for simple untagged union.",
+                            "Matching signals:",
+                            ...union.signals.map((s, i) => s.kind === "literal" ? `- ${union.labels[i]!}: ${s.prop} == ${s.value}` : `- ${union.labels[i]!}: has key ${s.prop}`),
+                            union.allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
+                          ].join("\n")
+                        );
+                        if (decDoc) modItems.push({ kind: "raw", code: decDoc });
+                        modItems.push({ kind: "module", name: `Decoder_${toValidModuleName(adtName)}`, items: [
+                          { kind: "raw", code: rsPriv2 },
+                          { kind: "raw", code: rsThrow2 },
+                          { kind: "raw", code: rsRes2 },
+                        ]});
+                        bodyType = aliasName;
+                      } else if (union && !union.ok) {
+                        bodyType = "JSON.t";
                       } else {
-                        payload = printTypeIR(ir);
+                        const auxReq: Array<TypeDeclIR> = [];
+                        let ir = mapSchemaToIR(chosen.schema, ctx, {
+                          parentName: base,
+                          collectAux: (n, b) => {
+                            const { doc, code } = splitDocBlock(b);
+                            auxReq.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                          },
+                          optionalAsOption: true,
+                        });
+                        ir = hoistInlineRecordsIR(
+                          ir,
+                          (n, b) => {
+                            const { doc, code } = splitDocBlock(b);
+                            auxReq.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                          },
+                          base,
+                          true,
+                          undefined,
+                          /*qualify*/ true,
+                        );
+                        ir = qualifyComponentRefsIR(ir);
+                        if (auxReq.length > 0) {
+                          for (const t of auxReq) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push(t);
+                        }
+                        if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
+                          if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                          payload = base;
+                        } else {
+                          payload = printTypeIR(ir);
+                        }
                       }
                     } else {
                       payload = "unknown";
