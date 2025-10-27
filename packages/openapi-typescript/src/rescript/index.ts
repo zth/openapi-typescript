@@ -32,7 +32,7 @@ import type { RSNode, TypeIR, FieldIR } from "./ir.js";
 import { raw as rawIR, withDoc, ref as refIR, app as appIR, record as recordIR, poly as polyIR, adt as adtIR } from "./ir.js";
 import { printFile, printTypeIR } from "./printer.js";
 
-// NOTE: Known-error status annotation has been removed.
+// ReScript emitter for Operations, Callbacks and Components
 
 // --- rsInclude support: dependency walker and selection helpers ---
 function isSchemaRefToComponent(ref: string): { ok: true; name: string } | { ok: false } {
@@ -2504,7 +2504,6 @@ export function emitReScript(schema: OpenAPI3, ctx: RSContext): string {
         'external createClient: createClientOptions => Client.clientContainer<client> = "createClient"',
     });
     file.push({ kind: "blank" });
-    // Simple createClient without error code annotations
     const createClientBody = [
       "let createClient = options => {",
       "  let c = createFetchClient(createClient(options))",
@@ -3036,6 +3035,8 @@ function buildOperations(
           }
         };
 
+        // Track presence of a default response for doc/helper emission
+        let __hasDefault = false;
         if (responses && typeof responses === "object") {
           // Collect success bodies
       const bodies: { code: string; ty: string }[] = [];
@@ -3043,6 +3044,7 @@ function buildOperations(
             const isDefault = status === "default";
             const n = parseInt(status, 10);
             const is2xx = !isNaN(n) && n >= 200 && n < 300;
+            if (isDefault) __hasDefault = true;
             const refNameForCtor = ((): string | undefined => {
               if (isRef(respLike)) {
                 const nm = refName(respLike.$ref);
@@ -3345,10 +3347,18 @@ function buildOperations(
                   );
                   ir = qualifyComponentRefsIR(ir);
                   if (auxLocal.length > 0) {
-                    for (const t of auxLocal) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                    if (is2xx) {
+                      for (const t of auxLocal) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                    } else if (!isDefault) {
+                      for (const t of auxLocal) if (!auxTypes.some((x) => x.name === t.name)) auxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                    }
                   }
                   if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
-                    if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                    if (is2xx) {
+                      if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                    } else if (!isDefault) {
+                      if (!auxTypes.some((x) => x.name === base)) auxTypes.push({ name: base, body: ir });
+                    }
                     payload = base;
                   } else {
                     payload = printTypeIR(ir);
@@ -3365,54 +3375,57 @@ function buildOperations(
 
             if (is2xx) bodies.push({ code: status, ty: payload ?? "unknown" });
 
-            // Per-status headers
+            // Per-status headers (skip for default; it will never match)
             const headersVal = resolved && typeof resolved === "object" ? resolved.headers : undefined;
-            const headerTypeName = toValidTypeName(`status_${isDefault ? "default" : status}_headers`);
-            if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
-              if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
-                const fieldsIR: FieldIR[] = [];
-                for (const [hname, hlike] of Object.entries(headersVal)) {
-                  const header: HeaderObject | undefined = isRef(hlike)
-                    ? ctx.resolve<HeaderObject>(hlike.$ref)
-                    : hlike;
-                  let actualIR: TypeIR = refIR("string");
-                  if (header && typeof header === "object") {
-                    if (header.schema) {
-                      actualIR = mapSchemaToIR(header.schema, ctx, {});
-                    } else if (header.content && typeof header.content === "object") {
-                      const ents = Object.entries(header.content);
-                      const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
-                      const chosen = chosenEntry?.[1];
-                      const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
-                  if (chosenResolved && chosenResolved.schema) actualIR = qualifyComponentRefsIR(mapSchemaToIR(chosenResolved.schema, ctx, { collectAuxDecl: (node) => { modItems.push(node); } }));
-                      else actualIR = rawIR("unknown");
+            let headerTypeName: string | undefined = undefined;
+            if (!isDefault) {
+              headerTypeName = toValidTypeName(`status_${status}_headers`);
+              if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
+                if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
+                  const fieldsIR: FieldIR[] = [];
+                  for (const [hname, hlike] of Object.entries(headersVal)) {
+                    const header: HeaderObject | undefined = isRef(hlike)
+                      ? ctx.resolve<HeaderObject>(hlike.$ref)
+                      : hlike;
+                    let actualIR: TypeIR = refIR("string");
+                    if (header && typeof header === "object") {
+                      if (header.schema) {
+                        actualIR = mapSchemaToIR(header.schema, ctx, {});
+                      } else if (header.content && typeof header.content === "object") {
+                        const ents = Object.entries(header.content);
+                        const chosenEntry = ents.find(([k]) => k === "application/json") ?? ents[0];
+                        const chosen = chosenEntry?.[1];
+                        const chosenResolved = chosen && isRef(chosen) ? ctx.resolve<MediaTypeObject>(chosen.$ref) : chosen;
+                        if (chosenResolved && chosenResolved.schema) actualIR = qualifyComponentRefsIR(mapSchemaToIR(chosenResolved.schema, ctx, { collectAuxDecl: (node) => { modItems.push(node); } }));
+                        else actualIR = rawIR("unknown");
+                      }
                     }
+                    const fn = toValidResFieldName(hname);
+                    const field: FieldIR = {
+                      name: fn.rendered,
+                      attr: fn.attr ?? undefined,
+                      typ: refIR("string"),
+                      optional: "option",
+                    };
+                    const printedActual = printTypeIR(actualIR);
+                    if (printedActual !== "string") {
+                      const doc = wrapBlockDoc(`actual: ${printedActual}`);
+                      if (doc) field.doc = doc;
+                    }
+                    fieldsIR.push(field);
                   }
-                  const fn = toValidResFieldName(hname);
-                  const field: FieldIR = {
-                    name: fn.rendered,
-                    attr: fn.attr ?? undefined,
-                    typ: refIR("string"),
-                    optional: "option",
-                  };
-                  const printedActual = printTypeIR(actualIR);
-                  if (printedActual !== "string") {
-                    const doc = wrapBlockDoc(`actual: ${printedActual}`);
-                    if (doc) field.doc = doc;
-                  }
-                  fieldsIR.push(field);
+                  headerTypeDefs.push({ name: headerTypeName, body: recordIR(fieldsIR) });
+                } else {
+                  headerTypeDefs.push({ name: headerTypeName, body: rawIR("emptyObject") });
                 }
-                headerTypeDefs.push({ name: headerTypeName, body: recordIR(fieldsIR) });
-              } else {
-                headerTypeDefs.push({ name: headerTypeName, body: rawIR("emptyObject") });
               }
             }
 
             // Build variants
             const ctorBase = refNameForCtor ?? "Data";
-            const asAttr = isDefault ? `@as("default") ` : !isNaN(n) ? `@as(${status}) ` : undefined;
+            const asAttr = !isNaN(n) ? `@as(${status}) ` : undefined;
             if (is2xx) {
-              const ctor = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
+              const ctor = `${ctorBase}S${status}`;
               let c = ctor;
               let i = 2;
               while (usedSuccessCtors.has(c)) c = `${ctor}_${i++}`;
@@ -3443,27 +3456,29 @@ function buildOperations(
               successPayloadTypes.push(pl);
               successStatusCodes.push(status);
             } else {
-              let c = ctorBase;
-              if (usedErrorCtors.has(c)) {
-                c = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
-                let j = 2;
-                while (usedErrorCtors.has(c)) c = `${c}_${j++}`;
+              if (!isDefault) {
+                let c = ctorBase;
+                if (usedErrorCtors.has(c)) {
+                  c = `${ctorBase}S${status}`;
+                  let j = 2;
+                  while (usedErrorCtors.has(c)) c = `${c}_${j++}`;
+                }
+                usedErrorCtors.add(c);
+                let pl = payload ?? "unknown";
+                if (pl === "unit" && noContent) {
+                  const auxName = toValidTypeName(`status_${status}_error`);
+                  const doc = wrapBlockDoc("response has no content");
+                  addAuxType(auxName, `${doc ? doc + "\n" : ""}unit`);
+                  pl = auxName;
+                }
+                // Inline the error result record directly in the ADT payload (no aux type)
+                const inlineRec = recordIR([
+                  { name: "error", typ: rawIR(pl) },
+                  { name: "response", typ: refIR("Response.t") },
+                  { name: "headers", typ: refIR(headerTypeName!) },
+                ]);
+                errorVariants.push({ label: c, payload: inlineRec, attr: asAttr });
               }
-              usedErrorCtors.add(c);
-              let pl = payload ?? "unknown";
-              if (pl === "unit" && noContent) {
-                const auxName = toValidTypeName(`status_${isDefault ? "default" : status}_error`);
-                const doc = wrapBlockDoc("response has no content");
-                addAuxType(auxName, `${doc ? doc + "\n" : ""}unit`);
-                pl = auxName;
-              }
-              // Inline the error result record directly in the ADT payload (no aux type)
-              const inlineRec = recordIR([
-                { name: "error", typ: rawIR(pl) },
-                { name: "response", typ: refIR("Response.t") },
-                { name: "headers", typ: refIR(headerTypeName) },
-              ]);
-              errorVariants.push({ label: c, payload: inlineRec, attr: asAttr });
             }
           }
 
@@ -3513,6 +3528,7 @@ function buildOperations(
           // error ADT via IR (always ADT)
           if (errorVariants.length > 0) {
             modItems.push({ kind: "attr", code: '@tag("status")' });
+            modItems.push({ kind: "attr", code: `@editor.completeFrom(Operations.${mod})` });
             const cases = errorVariants.map((v) => ({ label: v.label, payload: v.payload, attr: v.attr }));
             modItems.push({ kind: "type", keyword: "type", name: "error", body: adtIR(cases) });
           } else {
@@ -3531,6 +3547,19 @@ function buildOperations(
           if (n.kind === "type") {
             n.body = qualifyComponentRefsIR(n.body);
           }
+        }
+        if (__hasDefault) {
+          // Emit an identity helper to cast the error ADT to JSON.t with an explanatory doc
+          const doc = wrapBlockDoc(
+            [
+              'Note: this operation declares a "default" error response.',
+              'Default-style error classification is not currently modeled precisely.',
+              'Use the helper below to treat the full error variant as JSON (temporary escape hatch).',
+              'This will be improved in a future version.'
+            ].join("\n")
+          );
+          if (doc) modItems.push({ kind: "raw", code: doc });
+          modItems.push({ kind: "raw", code: "let errorToJSON: error => JSON.t = v => Obj.magic(v)" });
         }
         opsItems.push({ kind: "module", name: mod, items: modItems });
       }
@@ -3968,6 +3997,10 @@ function buildOperations(
                 for (const [status, respLike] of entries) {
                   const resp = isRef(respLike) ? ctx.resolve<ResponseObject>(respLike.$ref) : respLike;
                   if (!resp || typeof resp !== "object") continue;
+                  const isDefault = status === "default";
+                  const n = Number(status);
+                  const is2xx = !isNaN(n) && n >= 200 && n < 300;
+                  const refNameForCtor = isRef(respLike) ? refName(respLike.$ref) : undefined;
                   let payload: string | undefined;
                   let unknownReason: string | undefined;
                   let noContent: boolean = false;
@@ -3985,6 +4018,10 @@ function buildOperations(
                         return undefined;
                       })();
                       if (union && union.ok) {
+                        if (isDefault) {
+                          // Skip emitting types for default; not represented in error ADT
+                          payload = "unknown";
+                        } else {
                         const adtName = toValidTypeName(`status_${status}_result_data`);
                         const aliasName = toValidTypeName(`${adtName}_wrapped`);
                         const cases: Array<{ label: string; payload: TypeIR }> = [];
@@ -4165,66 +4202,76 @@ function buildOperations(
                           ]});
                         }
                         payload = aliasName;
+                        }
                       } else if (union && !union.ok) {
-                        // Ambiguous untagged union in callback response → emit ADT + alias (encode-only)
-                        const adtName = toValidTypeName(`status_${status}_result_data`);
-                        const aliasName = toValidTypeName(`${adtName}_wrapped`);
-                        const casesAmb: Array<{ label: string; payload: TypeIR }> = [];
-                        const auxLocalAmb: Array<TypeDeclIR> = [];
-                        const membersAmb = ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).oneOf ?? ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).anyOf;
-                        for (let i = 0; i < (membersAmb as SchemaLike[]).length; i++) {
-                          const m = (membersAmb as SchemaLike[])[i]!;
-                          if (isRef(m)) {
-                            const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
-                            const lbl = toValidModuleName(rn ?? `Member${i + 1}`);
-                            casesAmb.push({ label: lbl, payload: qualifyComponentRefsIR(refIR(rn)) });
-                          } else {
-                            const payloadBase = toValidTypeName(`${adtName}_member_${i + 1}`);
-                            let irMem = mapSchemaToIR(m, ctx, {
-                              parentName: payloadBase,
-                              collectAux: (n, b) => {
-                                const { doc, code } = splitDocBlock(b);
-                                auxLocalAmb.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                              },
-                              optionalAsOption: true,
-                              qualifyOpsRefs: true,
-                              collectAuxIR: (n2, bodyIR) => { auxLocalAmb.push({ name: n2, body: bodyIR }); },
-                            });
-                            irMem = hoistInlineRecordsIR(
-                              irMem,
-                              (n, b) => {
-                                const { doc, code } = splitDocBlock(b);
-                                auxLocalAmb.push({ name: n, body: withDoc(doc, rawIR(code)) });
-                              },
-                              payloadBase,
-                              true,
-                              undefined,
-                              /*qualify*/ true,
-                              (n2, bodyIR) => { auxLocalAmb.push({ name: n2, body: bodyIR }); },
-                            );
-                            irMem = qualifyComponentRefsIR(irMem);
-                            const printed = printTypeIR(irMem);
-                            const auxNm = nameWithHash(payloadBase, printed);
-                            auxLocalAmb.push({ name: auxNm, body: irMem });
-                            const lbl = toValidModuleName(`Member${i + 1}`);
-                            casesAmb.push({ label: lbl, payload: refIR(auxNm) });
+                        if (isDefault) {
+                          // Skip emitting types for default; not represented in error ADT
+                          payload = "unknown";
+                        } else {
+                          // Ambiguous untagged union in callback response → emit ADT + alias (encode-only)
+                          const adtName = toValidTypeName(`status_${status}_result_data`);
+                          const aliasName = toValidTypeName(`${adtName}_wrapped`);
+                          const casesAmb: Array<{ label: string; payload: TypeIR }> = [];
+                          const auxLocalAmb: Array<TypeDeclIR> = [];
+                          const membersAmb = ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).oneOf ?? ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).anyOf;
+                          for (let i = 0; i < (membersAmb as SchemaLike[]).length; i++) {
+                            const m = (membersAmb as SchemaLike[])[i]!;
+                            if (isRef(m)) {
+                              const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
+                              const lbl = toValidModuleName(rn ?? `Member${i + 1}`);
+                              casesAmb.push({ label: lbl, payload: qualifyComponentRefsIR(refIR(rn)) });
+                            } else {
+                              const payloadBase = toValidTypeName(`${adtName}_member_${i + 1}`);
+                              let irMem = mapSchemaToIR(m, ctx, {
+                                parentName: payloadBase,
+                                collectAux: (n, b) => {
+                                  const { doc, code } = splitDocBlock(b);
+                                  auxLocalAmb.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                                },
+                                optionalAsOption: true,
+                                qualifyOpsRefs: true,
+                                collectAuxIR: (n2, bodyIR) => { auxLocalAmb.push({ name: n2, body: bodyIR }); },
+                              });
+                              irMem = hoistInlineRecordsIR(
+                                irMem,
+                                (n, b) => {
+                                  const { doc, code } = splitDocBlock(b);
+                                  auxLocalAmb.push({ name: n, body: withDoc(doc, rawIR(code)) });
+                                },
+                                payloadBase,
+                                true,
+                                undefined,
+                                /*qualify*/ true,
+                                (n2, bodyIR) => { auxLocalAmb.push({ name: n2, body: bodyIR }); },
+                              );
+                              irMem = qualifyComponentRefsIR(irMem);
+                              const printed = printTypeIR(irMem);
+                              const auxNm = nameWithHash(payloadBase, printed);
+                              auxLocalAmb.push({ name: auxNm, body: irMem });
+                              const lbl = toValidModuleName(`Member${i + 1}`);
+                              casesAmb.push({ label: lbl, payload: refIR(auxNm) });
+                            }
                           }
+                          if (auxLocalAmb.length > 0) {
+                            for (const t of auxLocalAmb) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
+                          }
+                          const ambDoc2 = wrapBlockDoc("Ambiguous untagged union: encode-only; no safe decoder (no unique discriminator). ");
+                          if (ambDoc2) modItems.push({ kind: "raw", code: ambDoc2 });
+                          modItems.push({ kind: "attr", code: '@tag("kind")' });
+                          modItems.push({ kind: "type", keyword: "type", name: adtName, body: adtIR(casesAmb) });
+                          const codecModName2_forAlias2 = toValidModuleName(adtName);
+                          if (ambDoc2) modItems.push({ kind: "raw", code: ambDoc2 });
+                          const fullDecoderPath2_forAlias2 = `Operations.${mod}.${codecModName2_forAlias2}`;
+                          modItems.push({ kind: "raw", code: `@editor.completeFrom(${fullDecoderPath2_forAlias2})\n type ${aliasName}` });
+                          const rsEncodeOnly2 = [`let encode: ${adtName} => ${aliasName} = v => UnionCodec.encode(v)`].join("\n");
+                          modItems.push({ kind: "module", name: toValidModuleName(adtName), items: [ { kind: "raw", code: rsEncodeOnly2 } ] });
+                          payload = aliasName;
                         }
-                        if (auxLocalAmb.length > 0) {
-                          for (const t of auxLocalAmb) modItems.push({ kind: "type", keyword: "type", name: t.name, body: t.body });
-                        }
-                        const ambDoc2 = wrapBlockDoc("Ambiguous untagged union: encode-only; no safe decoder (no unique discriminator). ");
-                        if (ambDoc2) modItems.push({ kind: "raw", code: ambDoc2 });
-                        modItems.push({ kind: "attr", code: '@tag("kind")' });
-                        modItems.push({ kind: "type", keyword: "type", name: adtName, body: adtIR(casesAmb) });
-                        const codecModName2_forAlias2 = toValidModuleName(adtName);
-                        if (ambDoc2) modItems.push({ kind: "raw", code: ambDoc2 });
-                        const fullDecoderPath2_forAlias2 = `Operations.${mod}.${codecModName2_forAlias2}`;
-                        modItems.push({ kind: "raw", code: `@editor.completeFrom(${fullDecoderPath2_forAlias2})\n type ${aliasName}` });
-                        const rsEncodeOnly2 = [`let encode: ${adtName} => ${aliasName} = v => UnionCodec.encode(v)`].join("\n");
-                        modItems.push({ kind: "module", name: toValidModuleName(adtName), items: [ { kind: "raw", code: rsEncodeOnly2 } ] });
-                        payload = aliasName;
                       } else {
+                        if (isDefault) {
+                          // Skip emitting types for default; not represented in error ADT
+                          payload = "unknown";
+                        } else {
                         const auxReq: Array<TypeDeclIR> = [];
                         let ir = mapSchemaToIR(chosen.schema, ctx, {
                           parentName: base,
@@ -4247,13 +4294,22 @@ function buildOperations(
                         );
                         ir = qualifyComponentRefsIR(ir);
                   if (auxReq.length > 0) {
-                          for (const t of auxReq) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                          if (is2xx) {
+                            for (const t of auxReq) if (!successAuxTypes.some((x) => x.name === t.name)) successAuxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                          } else if (!isDefault) {
+                            for (const t of auxReq) if (!auxTypes.some((x) => x.name === t.name)) auxTypes.push({ name: t.name, body: qualifyComponentRefsIR(t.body) });
+                          }
                         }
                         if (ir.kind === "record" || (ir.kind === "withDoc" && ir.inner.kind === "record")) {
-                          if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                          if (is2xx) {
+                            if (!successAuxTypes.some((x) => x.name === base)) successAuxTypes.push({ name: base, body: ir });
+                          } else if (!isDefault) {
+                            if (!auxTypes.some((x) => x.name === base)) auxTypes.push({ name: base, body: ir });
+                          }
                           payload = base;
                         } else {
                           payload = printTypeIR(ir);
+                        }
                         }
                       }
                     } else {
@@ -4264,14 +4320,11 @@ function buildOperations(
                     payload = "unit";
                     noContent = true;
                   }
-                  const isDefault = status === "default";
-                  const n = Number(status);
-                  const is2xx = !isNaN(n) && n >= 200 && n < 300;
-                  const refNameForCtor = isRef(respLike) ? refName(respLike.$ref) : undefined;
                   if (is2xx && payload) bodies.push({ code: status, ty: payload });
                   const headersVal = resp.headers;
-                  const headerTypeName = toValidTypeName(`status_${status === "default" ? "default" : status}_headers`);
-                  if (!headerTypeDefs.some((t) => t.name === headerTypeName)) {
+                  let headerTypeName: string | undefined = undefined;
+                  if (!isDefault) headerTypeName = toValidTypeName(`status_${status}_headers`);
+                  if (headerTypeName && !headerTypeDefs.some((t) => t.name === headerTypeName)) {
                     if (headersVal && typeof headersVal === "object" && Object.keys(headersVal).length > 0) {
                       const fields: FieldIR[] = [];
                       for (const [hname, hlike] of Object.entries(headersVal)) {
@@ -4309,9 +4362,9 @@ function buildOperations(
                   }
 
                   const ctorBase = refNameForCtor ?? "Data";
-                  const asAttr = isDefault ? `@as("default") ` : !isNaN(n) ? `@as(${status}) ` : undefined;
+                  const asAttr = !isNaN(n) ? `@as(${status}) ` : undefined;
                   if (is2xx) {
-                    const ctor = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
+                    const ctor = `${ctorBase}S${status}`;
                     let c = ctor;
                     let i = 2;
                     while (usedSuccessCtors.has(c)) c = `${ctor}_${i++}`;
@@ -4342,21 +4395,23 @@ function buildOperations(
                     successPayloadTypes.push(pl);
                     successStatusCodes.push(status);
                   } else {
-                    let c = ctorBase;
-                    if (usedErrorCtors.has(c)) {
-                      c = isDefault ? `${ctorBase}Default` : `${ctorBase}S${status}`;
-                      let j = 2;
-                      while (usedErrorCtors.has(c)) c = `${c}_${j++}`;
+                    if (!isDefault) {
+                      let c = ctorBase;
+                      if (usedErrorCtors.has(c)) {
+                        c = `${ctorBase}S${status}`;
+                        let j = 2;
+                        while (usedErrorCtors.has(c)) c = `${c}_${j++}`;
+                      }
+                      usedErrorCtors.add(c);
+                      let pl = payload ?? "unknown";
+                      // Inline the error result record directly in the ADT payload (no aux type)
+                      const pay = recordIR([
+                        { name: "error", typ: rawIR(pl) },
+                        { name: "response", typ: refIR("Response.t") },
+                        { name: "headers", typ: refIR(headerTypeName!) },
+                      ]);
+                      errorVariants.push({ label: c, payload: pay, attr: asAttr });
                     }
-                    usedErrorCtors.add(c);
-                    let pl = payload ?? "unknown";
-                    // Inline the error result record directly in the ADT payload (no aux type)
-                    const pay = recordIR([
-                      { name: "error", typ: rawIR(pl) },
-                      { name: "response", typ: refIR("Response.t") },
-                      { name: "headers", typ: refIR(headerTypeName) },
-                    ]);
-                    errorVariants.push({ label: c, payload: pay, attr: asAttr });
                   }
                 }
 
@@ -4400,6 +4455,7 @@ function buildOperations(
                 }
                 if (errorVariants.length > 0) {
                   modItems.push({ kind: "attr", code: '@tag("status")' });
+                  modItems.push({ kind: "attr", code: `@editor.completeFrom(Operations.${mod})` });
                   const cases = errorVariants.map((v) => ({ label: v.label, payload: v.payload, attr: v.attr }));
                   modItems.push({ kind: "type", keyword: "type", name: "error", body: adtIR(cases) });
                 } else {
