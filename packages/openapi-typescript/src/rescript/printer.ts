@@ -21,6 +21,8 @@ function printTypeIR(t: TypeIR): string {
       const lines: string[] = [];
       const emitField = (f: FieldIR) => {
         if (f.doc) lines.push(f.doc);
+        // Field names are always valid identifiers here; when the original name
+        // needs quoting, an @as("...") attribute is attached to the field.
         const head = `${f.attr ?? ""}${f.name}`;
         const ty = printTypeIR(f.typ);
         if (f.optional === "questionMark") {
