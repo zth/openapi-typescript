@@ -30,6 +30,7 @@ import {
 } from "./utils.js";
 import type { RSNode, TypeIR, FieldIR } from "./ir.js";
 import { raw as rawIR, withDoc, ref as refIR, app as appIR, record as recordIR, poly as polyIR, adt as adtIR } from "./ir.js";
+import { alphaEq, isNullApp, unwrapNull, isRefNamed, isArrayIR, chooseNarrowerIR } from "./ir_utils.js";
 import { printFile, printTypeIR } from "./printer.js";
 
 // ReScript emitter for Operations, Callbacks and Components
@@ -44,51 +45,69 @@ function collectSchemaRefs(schema: SchemaLike | undefined, ctx: RSContext, add: 
   if (!schema) return;
   if (isRef(schema)) {
     const r = schema.$ref;
-    const mm = typeof r === "string" ? isSchemaRefToComponent(r) : { ok: false } as const;
+    const mm = isSchemaRefToComponent(r);
     if (mm.ok) add(mm.name);
-    const resolved = ctx.resolve<SchemaObject>(r as string);
+    const resolved = ctx.resolve<SchemaObject>(r);
     if (resolved && typeof resolved === "object") collectSchemaRefs(resolved, ctx, add, seen);
     return;
   }
-  const s = schema as SchemaObject;
+  const s: SchemaObject = schema;
   if (!s || typeof s !== "object") return;
-  if (seen.has(s as object)) return;
-  seen.add(s as object);
+  if (seen.has(s)) return;
+  seen.add(s);
   // composition
-  if (Array.isArray((s as any).allOf)) (s as any).allOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
-  if (Array.isArray((s as any).oneOf)) (s as any).oneOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
-  if (Array.isArray((s as any).anyOf)) (s as any).anyOf.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
-  if ((s as any).not) collectSchemaRefs((s as any).not, ctx, add, seen);
-  // arrays / tuples
-  const items = (s as any).items;
-  if (items) {
-    if (Array.isArray(items)) items.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
-    else collectSchemaRefs(items as SchemaLike, ctx, add, seen);
+  if (Array.isArray(s.allOf)) s.allOf.forEach((m) => collectSchemaRefs(m, ctx, add, seen));
+  if (Array.isArray(s.oneOf)) s.oneOf.forEach((m) => collectSchemaRefs(m, ctx, add, seen));
+  if (Array.isArray(s.anyOf)) s.anyOf.forEach((m) => collectSchemaRefs(m, ctx, add, seen));
+  // additional JSON Schema keywords not declared on SchemaObject in types.ts
+  const hasExtra = (k: "not" | "if" | "then" | "else"): SchemaLike | undefined => {
+    const rec = s as unknown as Record<string, unknown>;
+    const v = rec[k];
+    return v && typeof v === "object" ? (v as SchemaLike) : undefined;
+  };
+  {
+    const v = hasExtra("not");
+    if (v) collectSchemaRefs(v, ctx, add, seen);
   }
-  const prefixItems = (s as any).prefixItems;
-  if (Array.isArray(prefixItems)) prefixItems.forEach((m: SchemaLike) => collectSchemaRefs(m, ctx, add, seen));
+  // arrays / tuples
+  if (isArraySchema(s)) {
+    const items = s.items;
+    if (items) {
+      if (Array.isArray(items)) items.forEach((m) => collectSchemaRefs(m, ctx, add, seen));
+      else collectSchemaRefs(items, ctx, add, seen);
+    }
+    const prefixItems = s.prefixItems;
+    if (Array.isArray(prefixItems)) prefixItems.forEach((m) => collectSchemaRefs(m, ctx, add, seen));
+  }
   // objects
-  const props = (s as any).properties as Record<string, SchemaLike> | undefined;
-  if (props && typeof props === "object")
-    for (const v of Object.values(props)) collectSchemaRefs(v, ctx, add, seen);
-  const addl = (s as any).additionalProperties as boolean | SchemaLike | undefined;
-  if (addl && typeof addl === "object") collectSchemaRefs(addl as SchemaLike, ctx, add, seen);
-  const patt = (s as any).patternProperties as Record<string, SchemaLike> | undefined;
-  if (patt && typeof patt === "object") for (const v of Object.values(patt)) collectSchemaRefs(v, ctx, add, seen);
+  if (isObjectSchema(s)) {
+    const props = s.properties as Record<string, SchemaLike> | undefined;
+    if (props && typeof props === "object")
+      for (const v of Object.values(props)) collectSchemaRefs(v, ctx, add, seen);
+    const addl = s.additionalProperties as boolean | SchemaLike | undefined;
+    if (addl && typeof addl === "object") collectSchemaRefs(addl, ctx, add, seen);
+    const patt = s.patternProperties as Record<string, SchemaLike> | undefined;
+    if (patt && typeof patt === "object") for (const v of Object.values(patt)) collectSchemaRefs(v, ctx, add, seen);
+  }
   // conditional
-  if ((s as any).if) collectSchemaRefs((s as any).if, ctx, add, seen);
-  if ((s as any).then) collectSchemaRefs((s as any).then, ctx, add, seen);
-  if ((s as any).else) collectSchemaRefs((s as any).else, ctx, add, seen);
+  {
+    const vIf = hasExtra("if");
+    if (vIf) collectSchemaRefs(vIf, ctx, add, seen);
+    const vThen = hasExtra("then");
+    if (vThen) collectSchemaRefs(vThen, ctx, add, seen);
+    const vElse = hasExtra("else");
+    if (vElse) collectSchemaRefs(vElse, ctx, add, seen);
+  }
 }
 
 function collectFromParameter(param: import("../types.js").ParameterObject | undefined, ctx: RSContext, add: (name: string) => void, seen: Set<object>) {
   if (!param) return;
-  if (param.schema) collectSchemaRefs(param.schema as SchemaLike, ctx, add, seen);
+  if (param.schema) collectSchemaRefs(param.schema, ctx, add, seen);
   if (param.content && typeof param.content === "object") {
     for (const mt of Object.values(param.content)) {
-      const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
-      if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
-        collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+      const mtResolved = isRef(mt) ? ctx.resolve<import("../types.js").MediaTypeObject>(mt.$ref) : mt;
+      if (mtResolved && typeof mtResolved === "object" && mtResolved.schema)
+        collectSchemaRefs(mtResolved.schema, ctx, add, seen);
     }
   }
 }
@@ -99,20 +118,20 @@ function collectFromOperation(op: OperationObject | undefined, ctx: RSContext, a
   const opParams = op.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
   if (Array.isArray(opParams)) {
     for (const p of opParams) {
-      const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : (p as any);
+      const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : p;
       if (pr) collectFromParameter(pr, ctx, add, seen);
     }
   }
   // request body
   const rb = op.requestBody;
   if (rb) {
-    const req = isRef(rb) ? ctx.resolve<RequestBodyObject>(rb.$ref) : (rb as any);
-    const content = req && (req as any).content && typeof (req as any).content === "object" ? (req as any).content : undefined;
+    const req = isRef(rb) ? ctx.resolve<RequestBodyObject>(rb.$ref) : rb;
+    const content = req && req.content && typeof req.content === "object" ? req.content : undefined;
     if (content) {
       for (const mt of Object.values(content)) {
-        const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
-        if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
-          collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+        const mtResolved = isRef(mt) ? ctx.resolve<import("../types.js").MediaTypeObject>(mt.$ref) : mt;
+        if (mtResolved && typeof mtResolved === "object" && mtResolved.schema)
+          collectSchemaRefs(mtResolved.schema, ctx, add, seen);
       }
     }
   }
@@ -120,30 +139,30 @@ function collectFromOperation(op: OperationObject | undefined, ctx: RSContext, a
   const resps = op.responses as import("../types.js").ResponsesObject | undefined;
   if (resps && typeof resps === "object") {
     for (const rv of Object.values(resps)) {
-      const resp = isRef(rv as any) ? ctx.resolve<ResponseObject>((rv as any).$ref) : (rv as any);
+      const resp = isRef(rv) ? ctx.resolve<ResponseObject>(rv.$ref) : rv;
       if (!resp || typeof resp !== "object") continue;
       // content
-      const content = (resp as any).content;
+      const content = resp.content;
       if (content && typeof content === "object") {
         for (const mt of Object.values(content)) {
-          const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
-          if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
-            collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+          const mtResolved = isRef(mt) ? ctx.resolve<import("../types.js").MediaTypeObject>(mt.$ref) : mt;
+          if (mtResolved && typeof mtResolved === "object" && mtResolved.schema)
+            collectSchemaRefs(mtResolved.schema, ctx, add, seen);
         }
       }
       // headers (schemas or content)
-      const headers = (resp as any).headers;
+      const headers = resp.headers;
       if (headers && typeof headers === "object") {
         for (const h of Object.values(headers as Record<string, HeaderObject | ReferenceObject>)) {
-          const hdr = isRef(h as any) ? ctx.resolve<HeaderObject>((h as any).$ref) : (h as any);
+          const hdr = isRef(h) ? ctx.resolve<HeaderObject>(h.$ref) : h;
           if (!hdr || typeof hdr !== "object") continue;
-          if ((hdr as any).schema) collectSchemaRefs((hdr as any).schema, ctx, add, seen);
-          const hContent = (hdr as any).content;
+          if (hdr.schema) collectSchemaRefs(hdr.schema, ctx, add, seen);
+          const hContent = hdr.content as Record<string, import("../types.js").MediaTypeObject | ReferenceObject> | undefined;
           if (hContent && typeof hContent === "object") {
-            for (const mt of Object.values(hContent as Record<string, import("../types.js").MediaTypeObject | ReferenceObject>)) {
-              const mtResolved = isRef(mt as any) ? ctx.resolve<import("../types.js").MediaTypeObject>((mt as any).$ref) : (mt as any);
-              if (mtResolved && typeof mtResolved === "object" && (mtResolved as any).schema)
-                collectSchemaRefs((mtResolved as any).schema, ctx, add, seen);
+            for (const mt of Object.values(hContent)) {
+              const mtResolved = isRef(mt) ? ctx.resolve<import("../types.js").MediaTypeObject>(mt.$ref) : mt;
+              if (mtResolved && typeof mtResolved === "object" && mtResolved.schema)
+                collectSchemaRefs(mtResolved.schema, ctx, add, seen);
             }
           }
         }
@@ -154,24 +173,24 @@ function collectFromOperation(op: OperationObject | undefined, ctx: RSContext, a
   const cbs = op.callbacks as Record<string, CallbackObject | ReferenceObject> | undefined;
   if (cbs && typeof cbs === "object") {
     for (const cb of Object.values(cbs)) {
-      const cbResolved = isRef(cb as any) ? ctx.resolve<CallbackObject>((cb as any).$ref) : (cb as any);
+      const cbResolved = isRef(cb) ? ctx.resolve<CallbackObject>(cb.$ref) : cb;
       if (!cbResolved || typeof cbResolved !== "object") continue;
-      for (const cbPathItemLike of Object.values(cbResolved)) {
-        const cbItem = isRef(cbPathItemLike as any)
-          ? ctx.resolve<PathItemObject>((cbPathItemLike as any).$ref)
-          : (cbPathItemLike as any);
+      for (const cbPathItemLike of Object.values(cbResolved as Record<string, PathItemObject | ReferenceObject>)) {
+        const cbItem = isRef(cbPathItemLike)
+          ? ctx.resolve<PathItemObject>(cbPathItemLike.$ref)
+          : cbPathItemLike;
         if (!cbItem || typeof cbItem !== "object") continue;
         // path-level params for callback
-        const cbParams = (cbItem as any).parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
+        const cbParams = cbItem.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
         if (Array.isArray(cbParams)) {
           for (const p of cbParams) {
-            const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : (p as any);
+            const pr = isRef(p) ? ctx.resolve<import("../types.js").ParameterObject>(p.$ref) : p;
             if (pr) collectFromParameter(pr, ctx, add, seen);
           }
         }
         const METHODS: (keyof PathItemObject)[] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
         for (const m of METHODS) {
-          const op2 = resolveOperation((cbItem as any)[m], ctx);
+          const op2 = resolveOperation(cbItem[m], ctx);
           if (op2) collectFromOperation(op2, ctx, add, seen);
         }
       }
@@ -210,19 +229,19 @@ function computeSelectedSchemas(schema: OpenAPI3, ctx: RSContext): Set<string> |
   if ((includePaths || includePrefixes) && schema.paths && typeof schema.paths === "object") {
     for (const [p, item] of Object.entries(schema.paths)) {
       if (!pathIsIncluded(p, ctx)) continue;
-      const pathItem = isRef(item) ? ctx.resolve<PathItemObject>((item as any).$ref) : (item as any);
+      const pathItem = isRef(item) ? ctx.resolve<PathItemObject>(item.$ref) : item;
       if (!pathItem || typeof pathItem !== "object") continue;
       // path-level params
-      const pathParams = (pathItem as any).parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
+      const pathParams = pathItem.parameters as (import("../types.js").ParameterObject | ReferenceObject)[] | undefined;
       if (Array.isArray(pathParams)) {
         for (const par of pathParams) {
-          const resolved = isRef(par) ? ctx.resolve<import("../types.js").ParameterObject>(par.$ref) : (par as any);
+          const resolved = isRef(par) ? ctx.resolve<import("../types.js").ParameterObject>(par.$ref) : par;
           if (resolved) collectFromParameter(resolved, ctx, add, seen);
         }
       }
       const METHODS: (keyof PathItemObject)[] = ["get", "put", "post", "delete", "options", "head", "patch", "trace"];
       for (const m of METHODS) {
-        const op = resolveOperation((pathItem as any)[m], ctx);
+        const op = resolveOperation(pathItem[m], ctx);
         if (op) collectFromOperation(op, ctx, add, seen);
       }
     }
@@ -359,13 +378,14 @@ type SimpleUnionMember = {
   nonNullableProps: Set<string>;
 };
 
+type DetectionSignal =
+  | { kind: "literal"; prop: string; value: string }
+  | { kind: "key"; prop: string };
+
 type SimpleUnionDetection = {
   ok: true;
   // signals indexed by member position
-  signals: Array<
-    | { kind: "literal"; prop: string; value: string }
-    | { kind: "key"; prop: string }
-  >;
+  signals: DetectionSignal[];
   // suggested constructor labels per member (deduped)
   labels: string[];
   // whether Unknown(JSON.t) should be emitted for decoder no-match cases
@@ -382,15 +402,15 @@ function toADTCtorLabel(base: string, used: Set<string>): string {
 }
 
 function resolveObjectLikeForDetection(node: SchemaLike, ctx: RSContext): SchemaObject | undefined {
-  const s: SchemaObject | undefined = isRef(node) ? ctx.resolve<SchemaObject>((node as any).$ref) : (node as any);
+  const s: SchemaObject | undefined = isRef(node) ? ctx.resolve<SchemaObject>(node.$ref) : (node as SchemaObject);
   if (!s || typeof s !== "object") return undefined;
   // Attempt to descend allOf to find an object-like member (first found)
   const tryInlineObject = (v: SchemaLike | SchemaObject | undefined): SchemaObject | undefined => {
     if (!v) return undefined;
-    const n = isRef(v) ? ctx.resolve<SchemaObject>(v.$ref) : (v as any);
+    const n = isRef(v) ? ctx.resolve<SchemaObject>(v.$ref) : (v as SchemaObject);
     if (!n) return undefined;
-    if (Array.isArray((n as any).allOf) && (n as any).allOf.length > 0) {
-      for (const m of (n as any).allOf as SchemaLike[]) {
+    if (Array.isArray(n.allOf) && n.allOf.length > 0) {
+      for (const m of n.allOf as SchemaLike[]) {
         const k = tryInlineObject(m);
         if (k) return k;
       }
@@ -406,27 +426,28 @@ function collectMemberInfo(member: SchemaLike, ctx: RSContext): SimpleUnionMembe
   if (!s) return undefined;
   const refNm = isRef(member) ? refName(member.$ref) : undefined;
   const props: Record<string, SchemaLike> = ("properties" in s && s.properties) ? (s.properties as Record<string, SchemaLike>) : {};
-  const requiredArr = Array.isArray((s as any).required) ? ((s as any).required as string[]) : [];
+  const requiredArr = Array.isArray(s.required) ? s.required : [];
   const required = new Set<string>(requiredArr);
   const literalMarkers = new Map<string, string>();
   const nonNullable = new Set<string>();
   for (const [k, v] of Object.entries(props)) {
-    const node: SchemaObject | undefined = isRef(v) ? ctx.resolve<SchemaObject>((v as any).$ref) : (v as any);
+    const node: SchemaObject | undefined = isRef(v) ? ctx.resolve<SchemaObject>(v.$ref) : (v as SchemaObject);
     if (!node) continue;
     // literal marker
     if (node && typeof node === "object") {
-      if (Object.prototype.hasOwnProperty.call(node as any, "const") && (node as any).const != null) {
-        literalMarkers.set(k, String((node as any).const));
-      } else if (Array.isArray((node as any).enum) && (node as any).enum.length === 1) {
-        const v0 = (node as any).enum[0];
+      if (Object.prototype.hasOwnProperty.call(node, "const") && (node as { const?: unknown }).const != null) {
+        literalMarkers.set(k, String((node as { const?: unknown }).const));
+      } else if (Array.isArray(node.enum) && node.enum.length === 1) {
+        const v0 = node.enum[0];
         if (typeof v0 === "string" || typeof v0 === "number") literalMarkers.set(k, String(v0));
       }
     }
     // non-nullable detection: no explicit null and not nullable
     let nullable = false;
-    if ((node as any).nullable === true) nullable = true;
-    if (Array.isArray((node as any).type) && (node as any).type.includes("null")) nullable = true;
-    if (Array.isArray((node as any).enum) && (node as any).enum.some((x: any) => x == null)) nullable = true;
+    if (node.nullable === true) nullable = true;
+    const tField = (node as { type?: unknown }).type;
+    if (Array.isArray(tField) && tField.includes("null")) nullable = true;
+    if (Array.isArray(node.enum) && node.enum.some((x) => x == null)) nullable = true;
     if (!nullable) nonNullable.add(k);
   }
   return { schema: s, refName: refNm, properties: props, required, literalMarkers, nonNullableProps: nonNullable };
@@ -436,15 +457,15 @@ function detectSimpleUntaggedUnion(members: SchemaLike[], ctx: RSContext, discri
   // Check null members for allowUnknown
   const isNullTypeSchema = (m: SchemaLike | SchemaObject): boolean => {
     let mm: SchemaObject | undefined;
-    if (isRef(m)) mm = ctx.resolve<SchemaObject>((m as any).$ref);
-    else mm = m as any;
+    if (isRef(m)) mm = ctx.resolve<SchemaObject>(m.$ref);
+    else mm = m as SchemaObject;
     if (!mm) return false;
-    if ((mm as any).type === "null") return true;
-    if (Array.isArray((mm as any).type)) {
-      const arr = (mm as any).type as unknown[];
+    if ((mm as { type?: unknown }).type === "null") return true;
+    if (Array.isArray((mm as { type?: unknown }).type)) {
+      const arr = (mm as { type?: unknown }).type as unknown[];
       return arr.includes("null") && arr.filter((t) => t !== "null").length === 0;
     }
-    if (Array.isArray((mm as any).enum)) return (mm as any).enum.length === 1 && (mm as any).enum[0] == null;
+    if (Array.isArray(mm.enum)) return mm.enum.length === 1 && mm.enum[0] == null;
     return false;
   };
   const nonNullMembers = members.filter((m) => !isNullTypeSchema(m));
@@ -472,21 +493,21 @@ function detectSimpleUntaggedUnion(members: SchemaLike[], ctx: RSContext, discri
       literalCounts.set(k, mm);
     }
   }
-  const signals: SimpleUnionDetection["signals"] = [];
+  const signals: DetectionSignal[] = [];
   const labels: string[] = [];
   const used = new Set<string>();
   for (const ent of info) {
     // prefer discriminator mapping if present
     let labelBase: string | undefined;
-    if (discriminator && typeof discriminator === "object" && (discriminator as any).propertyName) {
-      const prop = (discriminator as any).propertyName as string;
+    if (discriminator && typeof discriminator === "object" && discriminator.propertyName) {
+      const prop = discriminator.propertyName;
       const ds = ent.properties[prop];
-      const dso: SchemaObject | undefined = ds ? (isRef(ds) ? ctx.resolve<SchemaObject>((ds as any).$ref) : (ds as any)) : undefined;
-      const val = dso && ("const" in (dso as any) ? (dso as any).const : Array.isArray((dso as any).enum) && (dso as any).enum.length === 1 ? (dso as any).enum[0] : undefined);
+      const dso: SchemaObject | undefined = ds ? (isRef(ds) ? ctx.resolve<SchemaObject>(ds.$ref) : (ds as SchemaObject)) : undefined;
+      const val = dso && ("const" in dso ? dso.const : Array.isArray(dso.enum) && dso.enum.length === 1 ? dso.enum[0] : undefined);
       if (val !== undefined) labelBase = String(val);
     }
     // Choose signal: literal unique across members, or unique non-null key
-    let sig: SimpleUnionDetection["signals"][number] | undefined;
+    let sig: DetectionSignal | undefined;
     // literal unique
     let litChoice: { prop: string; value: string } | undefined;
     outer: for (const [k, v] of ent.literalMarkers.entries()) {
@@ -599,65 +620,7 @@ function splitDocBlock(body: string): { doc?: string; code: string } {
 // (removed) legacy local printers; all code now builds RS IR and is printed by printer.ts
 
 // Structural equality for a useful subset of TypeIR nodes.
-function alphaEq(a: TypeIR, b: TypeIR): boolean {
-  if (a === b) return true;
-  if (a.kind === "withDoc") return alphaEq(a.inner, b);
-  if (b.kind === "withDoc") return alphaEq(a, b.inner);
-  if (a.kind !== b.kind) return false;
-  switch (a.kind) {
-    case "raw": {
-      if (b.kind !== "raw") return false;
-      return a.code.trim() === b.code.trim();
-    }
-    case "ref": {
-      const bb = b as Extract<TypeIR, { kind: "ref" }>;
-      return a.path.join(".") === bb.path.join(".");
-    }
-    case "app": {
-      const bb = b as Extract<TypeIR, { kind: "app" }>;
-      if (!alphaEq(a.callee, bb.callee)) return false;
-      if (a.args.length !== bb.args.length) return false;
-      for (let i = 0; i < a.args.length; i++) if (!alphaEq(a.args[i]!, bb.args[i]!)) return false;
-      return true;
-    }
-    case "record": {
-      const bb = b as Extract<TypeIR, { kind: "record" }>;
-      if (a.fields.length !== bb.fields.length) return false;
-      const af = [...a.fields].map((f) => ({ n: `${f.attr ?? ""}${f.name}`, o: f.optional, t: f.typ })).sort((x, y) => x.n.localeCompare(y.n));
-      const bf = [...bb.fields].map((f) => ({ n: `${f.attr ?? ""}${f.name}`, o: f.optional, t: f.typ })).sort((x, y) => x.n.localeCompare(y.n));
-      for (let i = 0; i < af.length; i++) {
-        if (af[i]!.n !== bf[i]!.n) return false;
-        if (af[i]!.o !== bf[i]!.o) return false;
-        if (!alphaEq(af[i]!.t, bf[i]!.t)) return false;
-      }
-      return true;
-    }
-    case "poly": {
-      const bb = b as Extract<TypeIR, { kind: "poly" }>;
-      if (a.cases.length !== bb.cases.length) return false;
-      const ac = [...a.cases].map((c) => ({ l: c.label, p: c.payload })).sort((x, y) => x.l.localeCompare(y.l));
-      const bc = [...bb.cases].map((c) => ({ l: c.label, p: c.payload })).sort((x, y) => x.l.localeCompare(y.l));
-      for (let i = 0; i < ac.length; i++) {
-        if (ac[i]!.l !== bc[i]!.l) return false;
-        const ap = ac[i]!.p;
-        const bp = bc[i]!.p;
-        if ((ap == null) !== (bp == null)) return false;
-        if (ap && bp && !alphaEq(ap, bp)) return false;
-      }
-      return true;
-    }
-    case "tuple": {
-      const bb = b as Extract<TypeIR, { kind: "tuple" }>;
-      if (a.items.length !== bb.items.length) return false;
-      for (let i = 0; i < a.items.length; i++) if (!alphaEq(a.items[i]!, bb.items[i]!)) return false;
-      return true;
-    }
-    case "adt": {
-      // For now, be conservative; compare printed representations
-      return printTypeIR(a) === printTypeIR(b);
-    }
-  }
-}
+// alphaEq moved to ir_utils.ts
 
 function pvLabelForValue(v: string): string {
   const isIdent = /^[A-Za-z_][A-Za-z0-9_]*$/.test(v);
@@ -665,20 +628,7 @@ function pvLabelForValue(v: string): string {
   return isIdent && !isReserved ? `#${v}` : `#${JSON.stringify(v)}`;
 }
 
-function isNullApp(t: TypeIR): t is Extract<TypeIR, { kind: "app" }> {
-  return (
-    t.kind === "app" &&
-    t.callee.kind === "ref" &&
-    t.callee.path.join(".") === "Null.t" &&
-    Array.isArray(t.args) &&
-    t.args.length === 1
-  );
-}
-
-function unwrapNull(t: TypeIR): TypeIR | undefined {
-  if (isNullApp(t)) return t.args[0]!;
-  return undefined;
-}
+// isNullApp/unwrapNull moved to ir_utils.ts
 
 // Hoist inline record field types to aux types to reduce nesting and avoid Null.t<{..}>.
 function hoistFieldTypeIfNeeded(
@@ -700,30 +650,32 @@ function hoistFieldTypeIfNeeded(
     const propBase = toValidTypeName(`${baseParent}_${propName}`);
     // Build a transformed record body where any nested inline records in fields are hoisted
     const prepared = qualify ? qualifyComponentRefsIR(typ) : typ;
-    const newFields = prepared.fields.map((f) => {
+    const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+    const newFields = preparedRec.fields.map((f: FieldIR) => {
       const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
       return nt === f.typ ? f : { ...f, typ: nt };
     });
     const nodeRec = recordIR(newFields);
     const printed = printTypeIR(nodeRec);
     const auxName = nameWithHash(propBase, printed);
-    if (typeof collectAuxIR === "function") collectAuxIR(auxName, nodeRec);
-    else if (typeof collectAux === "function") collectAux(auxName, printed);
+    if (typeof collectAuxIR === "function") (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, nodeRec);
+    else if (typeof collectAux === "function") (collectAux as (n: string, b: string) => void)(auxName, printed);
     return refIR(auxName);
   }
   if (
     isNullApp(typ) &&
-    (typ.args[0]!.kind === "record" || (typ.args[0]!.kind === "withDoc" && (typ.args[0] as any).inner?.kind === "record")) &&
+    (typ.args[0]!.kind === "record" || (typ.args[0]!.kind === "withDoc" && typ.args[0]!.inner.kind === "record")) &&
     (typeof collectAuxIR === "function" || typeof collectAux === "function")
   ) {
     const baseParent = parentName ?? "t";
     const propBase = toValidTypeName(`${baseParent}_${propName}`);
     if (typeof collectAuxIR === "function") {
-      const arg0 = typ.args[0]! as TypeIR;
+      const arg0 = typ.args[0]!;
       const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
       const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
       const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-      const newFields = prepared.fields.map((f) => {
+      const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+      const newFields = preparedRec.fields.map((f: FieldIR) => {
         const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
         return nt === f.typ ? f : { ...f, typ: nt };
       });
@@ -731,21 +683,22 @@ function hoistFieldTypeIfNeeded(
       const bodyIR = doc ? withDoc(doc, recNode) : recNode;
       const printed = printTypeIR(bodyIR);
       const auxName = nameWithHash(propBase, printed);
-      collectAuxIR(auxName, bodyIR);
+      (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, bodyIR);
       return appIR(refIR("Null.t"), [refIR(auxName)]);
     } else {
-      const arg0 = typ.args[0]! as TypeIR;
+      const arg0 = typ.args[0]!;
       const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
       const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
       const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-      const newFields = prepared.fields.map((f) => {
+      const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+      const newFields = preparedRec.fields.map((f: FieldIR) => {
         const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
         return nt === f.typ ? f : { ...f, typ: nt };
       });
       let printed = (doc ? `${doc}\n` : "") + printTypeIR(recordIR(newFields));
       if (qualify) printed = qualifyComponentRefsPrinted(printed);
       const auxName = nameWithHash(propBase, printed);
-      collectAux(auxName, printed);
+      (collectAux as (n: string, b: string) => void)(auxName, printed);
       return appIR(refIR("Null.t"), [refIR(auxName)]);
     }
   }
@@ -759,15 +712,16 @@ function hoistFieldTypeIfNeeded(
   ) {
     const innerApp = typ.args[0]!;
     const innerArg = innerApp.args[0];
-    if (innerArg && (innerArg.kind === "record" || (innerArg.kind === "withDoc" && (innerArg as any).inner?.kind === "record"))) {
+    if (innerArg && (innerArg.kind === "record" || (innerArg.kind === "withDoc" && innerArg.inner?.kind === "record"))) {
       const baseParent = parentName ?? "t";
       const propBase = toValidTypeName(`${baseParent}_${propName}`);
       if (typeof collectAuxIR === "function") {
-        const arg0 = innerArg as TypeIR;
+        const arg0 = innerArg;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
@@ -775,21 +729,22 @@ function hoistFieldTypeIfNeeded(
         const bodyIR = doc ? withDoc(doc, recIRNode) : recIRNode;
         const printed = printTypeIR(bodyIR);
         const auxName = nameWithHash(propBase, printed);
-        collectAuxIR(auxName, bodyIR);
+        (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, bodyIR);
         const replacedInner = { kind: "app", callee: innerApp.callee, args: [refIR(auxName)] } as TypeIR;
         return appIR(refIR("Null.t"), [replacedInner]);
       } else {
-        const arg0 = innerArg as TypeIR;
+        const arg0 = innerArg;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
         let printed = (doc ? `${doc}\n` : "") + printTypeIR(recordIR(newFields));
         const auxName = nameWithHash(propBase, printed);
-        collectAux(auxName, printed);
+        (collectAux as (n: string, b: string) => void)(auxName, printed);
         const replacedInner = { kind: "app", callee: innerApp.callee, args: [refIR(auxName)] } as TypeIR;
         return appIR(refIR("Null.t"), [replacedInner]);
       }
@@ -799,15 +754,16 @@ function hoistFieldTypeIfNeeded(
   if (typ.kind === "app" && typ.callee.kind === "ref" && (isRefNamed(typ.callee, "array") || isRefNamed(typ.callee, "dict"))) {
     const inner = typ.args[0];
     if (!inner) return typ;
-    if ((inner.kind === "record" || (inner.kind === "withDoc" && (inner as any).inner?.kind === "record")) && (typeof collectAuxIR === "function" || typeof collectAux === "function")) {
+    if ((inner.kind === "record" || (inner.kind === "withDoc" && inner.inner?.kind === "record")) && (typeof collectAuxIR === "function" || typeof collectAux === "function")) {
       const baseParent = parentName ?? "t";
       const propBase = toValidTypeName(`${baseParent}_${propName}`);
       if (typeof collectAuxIR === "function") {
-        const arg0 = inner as TypeIR;
+        const arg0 = inner;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
@@ -815,33 +771,35 @@ function hoistFieldTypeIfNeeded(
         const bodyIR = doc ? withDoc(doc, recIRNode) : recIRNode;
         const printed = printTypeIR(bodyIR);
         const auxName = nameWithHash(propBase, printed);
-        collectAuxIR(auxName, bodyIR);
+        (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, bodyIR);
         return appIR(typ.callee, [refIR(auxName)]);
       } else {
-        const arg0 = inner as TypeIR;
+        const arg0 = inner;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
         let printed = (doc ? `${doc}\n` : "") + printTypeIR(recordIR(newFields));
         if (qualify) printed = qualifyComponentRefsPrinted(printed);
         const auxName = nameWithHash(propBase, printed);
-        collectAux(auxName, printed);
+        (collectAux as (n: string, b: string) => void)(auxName, printed);
         return appIR(typ.callee, [refIR(auxName)]);
       }
     }
-    if (isNullApp(inner) && inner.args[0] && (inner.args[0]!.kind === "record" || (inner.args[0] as any).kind === "withDoc" && ((inner.args[0] as any).inner?.kind === "record")) && (typeof collectAux === "function" || typeof collectAuxIR === "function")) {
+    if (isNullApp(inner) && inner.args[0] && (inner.args[0]!.kind === "record" || (inner.args[0]!.kind === "withDoc" && inner.args[0]!.inner?.kind === "record")) && (typeof collectAux === "function" || typeof collectAuxIR === "function")) {
       const baseParent = parentName ?? "t";
       const propBase = toValidTypeName(`${baseParent}_${propName}`);
       if (typeof collectAuxIR === "function") {
-        const arg0 = inner.args[0]! as TypeIR;
+        const arg0 = inner.args[0]!;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
@@ -849,21 +807,22 @@ function hoistFieldTypeIfNeeded(
         const bodyIR = doc ? withDoc(doc, recNode) : recNode;
         const printed = printTypeIR(bodyIR);
         const auxName = nameWithHash(propBase, printed);
-        collectAuxIR(auxName, bodyIR);
+        (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, bodyIR);
         const newInner = appIR(refIR("Null.t"), [refIR(auxName)]);
         return appIR(typ.callee, [newInner]);
       } else {
-        const arg0 = inner.args[0]! as TypeIR;
+        const arg0 = inner.args[0]!;
         const doc = arg0.kind === "withDoc" ? arg0.doc : undefined;
         const rec0 = arg0.kind === "withDoc" ? arg0.inner : arg0;
         const prepared = qualify ? qualifyComponentRefsIR(rec0) : rec0;
-        const newFields = prepared.fields.map((f) => {
+        const preparedRec = prepared as Extract<TypeIR, { kind: "record" }>;
+        const newFields = preparedRec.fields.map((f: FieldIR) => {
           const nt = hoistFieldTypeIfNeeded(f.typ, collectAux, propBase, f.name, qualify, collectAuxIR);
           return nt === f.typ ? f : { ...f, typ: nt };
         });
         let printed = (doc ? `${doc}\n` : "") + printTypeIR(recordIR(newFields));
         const auxName = nameWithHash(propBase, printed);
-        collectAux(auxName, printed);
+        (collectAux as (n: string, b: string) => void)(auxName, printed);
         const newInner = appIR(refIR("Null.t"), [refIR(auxName)]);
         return appIR(typ.callee, [newInner]);
       }
@@ -894,7 +853,8 @@ function hoistInlineRecordsIR(
     // Hoist direct record-typed fields inside this aux by walking fields
     const bodyIR = prepared.kind === "record"
       ? (() => {
-          const newFields = prepared.fields.map((f) => {
+          const recNode = prepared;
+          const newFields = recNode.fields.map((f: FieldIR) => {
             const newTyp = hoistFieldTypeIfNeeded(f.typ, collectAux, baseNm, f.name, qualify, collectAuxIR);
             return newTyp === f.typ ? f : { ...f, typ: newTyp };
           });
@@ -904,9 +864,9 @@ function hoistInlineRecordsIR(
     const printed = printTypeIR(bodyIR);
     const auxName = mkAux(printed, hint);
     if (typeof collectAuxIR === "function") {
-      collectAuxIR(auxName, bodyIR);
+      (collectAuxIR as (n: string, b: TypeIR) => void)(auxName, bodyIR);
     } else if (typeof collectAux === "function") {
-      collectAux(auxName, printed);
+      (collectAux as (n: string, b: string) => void)(auxName, printed);
     }
     return refIR(auxName);
   };
@@ -917,7 +877,7 @@ function hoistInlineRecordsIR(
       if (!allowRecordHere) {
         return createAuxRef(typ, seg);
       }
-      const fields = typ.fields.map((f) => {
+      const fields = typ.fields.map((f: FieldIR) => {
         const hint = toValidTypeName(f.name);
         // First, hoist direct record types appearing as field types to aux
         let first = hoistFieldTypeIfNeeded(f.typ, collectAux, baseName, f.name, qualify, collectAuxIR);
@@ -973,35 +933,7 @@ function hoistInlineRecordsIR(
   }
 }
 
-function isRefNamed(t: TypeIR, name: string): boolean {
-  return t.kind === "ref" && t.path.join(".") === name;
-}
-
-function isArrayIR(t: TypeIR): t is Extract<TypeIR, { kind: "app" }> & { callee: Extract<TypeIR, { kind: "ref" }> } {
-  return t.kind === "app" && t.callee.kind === "ref" && t.callee.path.join(".") === "array" && t.args.length === 1;
-}
-
-function chooseNarrowerIR(a: TypeIR, b: TypeIR): "a" | "b" | undefined {
-  if (alphaEq(a, b)) return "a";
-  const aIsNull = isNullApp(a);
-  const bIsNull = isNullApp(b);
-  if (aIsNull && !bIsNull) return "a";
-  if (bIsNull && !aIsNull) return "b";
-  const aCore = aIsNull ? (a as Extract<TypeIR, { kind: "app" }>).args[0]! : a;
-  const bCore = bIsNull ? (b as Extract<TypeIR, { kind: "app" }>).args[0]! : b;
-  const aArr = isArrayIR(aCore) ? aCore : undefined;
-  const bArr = isArrayIR(bCore) ? bCore : undefined;
-  if (aArr && bArr) {
-    const res = chooseNarrowerIR(aArr.args[0]!, bArr.args[0]!);
-    return res ?? "a";
-  }
-  // Prefer PV union over primitive string/float
-  const aIsPrim = aCore.kind === "ref" && (isRefNamed(aCore, "string") || isRefNamed(aCore, "float"));
-  const bIsPrim = bCore.kind === "ref" && (isRefNamed(bCore, "string") || isRefNamed(bCore, "float"));
-  if (aIsPrim && bCore.kind === "poly") return "b";
-  if (bIsPrim && aCore.kind === "poly") return "a";
-  return undefined;
-}
+// isRefNamed/isArrayIR/chooseNarrowerIR moved to ir_utils.ts
 
 function mapSchemaToRes(
   schema: SchemaLike,
@@ -1086,8 +1018,9 @@ function mapSchemaToIR(
   if (!isRef(schema)) {
     const s: SchemaObject = schema;
     // Basic primitives and nullable type arrays → IR
-    if (Array.isArray((s as any).type)) {
-      const arr = (s as any).type as unknown[];
+    const sType = (s as { type?: unknown }).type;
+    if (Array.isArray(sType)) {
+      const arr = sType as unknown[];
       const hasNull = arr.includes("null");
       const others = arr.filter((t) => t !== "null");
       // string|number/integer (with optional null) → stringOrNumber
@@ -1097,13 +1030,14 @@ function mapSchemaToIR(
         return hasNull ? appIR(refIR("Null.t"), [base]) : base;
       }
       if (hasNull && others.length === 1) {
-        const tmp: SchemaObject = { ...s, type: others[0] as any };
+        const only = String(others[0]!);
+        const tmp = ({ ...s, type: only } as unknown) as SchemaObject;
         const inner = mapSchemaToIR(tmp, ctx, { parentName, collectAux, collectAuxIR, optionalAsOption, qualifyOpsRefs, collectAuxDecl });
         return appIR(refIR("Null.t"), [inner]);
       }
     }
-    if (typeof (s as any).type === "string" && !(Array.isArray((s as any).enum) && (s as any).enum.length > 0)) {
-      const t = (s as any).type as string;
+    if (typeof sType === "string" && !(Array.isArray(s.enum) && s.enum.length > 0)) {
+      const t = sType;
       if (t === "string" || t === "number" || t === "integer" || t === "boolean") {
         const base = t === "string" ? refIR("string") : t === "boolean" ? refIR("bool") : refIR("float");
         return s.nullable ? appIR(refIR("Null.t"), [base]) : base;
@@ -1135,9 +1069,9 @@ function mapSchemaToIR(
           const keys = Object.keys(mm as Record<string, unknown>).filter((k) => !["title", "description", "deprecated", "readOnly", "writeOnly", "examples", "example", "nullable"].includes(k));
           if (keys.length === 0) return true;
           if (mm.type === "object") {
-            const hasProps = "properties" in mm && (mm as any).properties && Object.keys((mm as any).properties ?? {}).length > 0;
+            const hasProps = "properties" in mm && mm.properties && Object.keys(mm.properties ?? {}).length > 0;
             const hasAP = "additionalProperties" in mm;
-            const hasCompo = Array.isArray((mm as any).oneOf) || Array.isArray((mm as any).anyOf) || Array.isArray((mm as any).allOf);
+            const hasCompo = Array.isArray(mm.oneOf) || Array.isArray(mm.anyOf) || Array.isArray(mm.allOf);
             if (!hasProps && !hasAP && !hasCompo) return true;
           }
         }
@@ -1155,14 +1089,14 @@ function mapSchemaToIR(
       let literalOk = true;
       let litKind: "string" | "number" | undefined;
       for (const m of nonNullMembers) {
-        const mm: SchemaObject | undefined = isRef(m) ? ctx.resolve<SchemaObject>(m.$ref) : (m as any);
+        const mm: SchemaObject | undefined = isRef(m) ? ctx.resolve<SchemaObject>(m.$ref) : (m as SchemaObject);
         if (!mm || typeof mm !== "object") {
           literalOk = false;
           break;
         }
-        let vals: any[] | undefined;
-        if (Array.isArray((mm as any).enum) && (mm as any).enum.length > 0) vals = (mm as any).enum as any[];
-        else if ("const" in (mm as any)) vals = [(mm as any).const];
+        let vals: unknown[] | undefined;
+        if (Array.isArray(mm.enum) && mm.enum.length > 0) vals = mm.enum as unknown[];
+        else if ("const" in mm) vals = [mm.const];
         if (!vals) {
           literalOk = false;
           break;
@@ -1197,11 +1131,11 @@ function mapSchemaToIR(
         let sawStr = false;
         let sawNum = false;
         for (const m of nonNullMembers) {
-          const mm: SchemaObject | undefined = isRef(m) ? ctx.resolve<SchemaObject>(m.$ref) : (m as any);
+          const mm: SchemaObject | undefined = isRef(m) ? ctx.resolve<SchemaObject>(m.$ref) : (m as SchemaObject);
           if (!mm || typeof mm !== "object") { ok = false; break; }
           // Require a direct primitive type with no enum/const to avoid clobbering literal unions
-          if ((mm as any).enum || (mm as any).const != null) { ok = false; break; }
-          const t = (mm as any).type;
+          if ((Array.isArray(mm.enum) && mm.enum.length > 0) || ("const" in mm && mm.const != null)) { ok = false; break; }
+          const t = (mm as { type?: unknown }).type;
           if (t === "string") sawStr = true;
           else if (t === "number" || t === "integer") sawNum = true;
           else { ok = false; break; }
@@ -1230,15 +1164,15 @@ function mapSchemaToIR(
           const aliasName = toValidTypeName(`${adtName}_wrapped`);
           // Build cases from refs
           const refCases: Array<{ label: string; payload: TypeIR }> = [];
-          if (det && (det as any).ok) {
-            const labels = (det as any).labels as string[];
+          if (det.ok) {
+            const labels = det.labels;
             for (let i = 0; i < unionMembers.length; i++) {
               const m = unionMembers[i]!;
               if (!isRef(m)) continue;
               const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
               refCases.push({ label: labels[i]!, payload: refIR(rn) });
             }
-            if ((det as any).allowUnknown) refCases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
+            if (det.allowUnknown) refCases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
             // Emit ADT + alias and decoder/encoder module
             collectAuxDecl({ kind: "attr", code: '@tag("kind")' });
             collectAuxDecl({ kind: "type", keyword: "type rec", name: adtName, body: adtIR(refCases) });
@@ -1250,10 +1184,10 @@ function mapSchemaToIR(
             const litMap = new Map<string, Array<{ value: string; label: string }>>();
             let sawKeys = false;
             const keyPairs: Array<{ prop: string; label: string }> = [];
-            if ((det as any).ok) {
-              for (let i = 0; i < (det as any).signals.length; i++) {
-                const sig = (det as any).signals[i]! as any;
-                const label = (det as any).labels[i]!;
+            if (det.ok) {
+              for (let i = 0; i < det.signals.length; i++) {
+                const sig = det.signals[i]!;
+                const label = det.labels[i]!;
                 if (sig.kind === "literal") {
                   const arr = litMap.get(sig.prop) ?? [];
                   arr.push({ value: String(sig.value), label });
@@ -1266,7 +1200,7 @@ function mapSchemaToIR(
               }
             }
             const buildTailOpt = (): string => {
-              let tail = (det as any).allowUnknown ? 'Some(UnionDecode.make("Unknown", json))' : 'None';
+              let tail = det.allowUnknown ? 'Some(UnionDecode.make("Unknown", json))' : 'None';
               for (let i = steps.length - 1; i >= 0; i--) {
                 const st = steps[i]!;
                 if (st.kind === "literal") {
@@ -1288,12 +1222,12 @@ function mapSchemaToIR(
               [
                 "Decoder for simple untagged union.",
                 "Matching signals:",
-                ...((det as any).signals as any[]).map((s: any, i: number) =>
+                ...det.signals.map((s, i) =>
                   s.kind === "literal"
-                    ? `- ${(det as any).labels[i]!}: ${s.prop} == ${s.value}`
-                    : `- ${(det as any).labels[i]!}: has key ${s.prop}`
+                    ? `- ${det.labels[i]!}: ${s.prop} == ${s.value}`
+                    : `- ${det.labels[i]!}: has key ${s.prop}`
                 ),
-                (det as any).allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
+                det.allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
               ].join("\n")
             );
             if (decDoc) collectAuxDecl({ kind: "raw", code: decDoc });
@@ -1577,15 +1511,16 @@ function mapSchemaToIR(
           return wrapNull ? appIR(refIR("Null.t"), [ref]) : ref;
         };
         // Special-case: type: ["object", "null"] on additionalProperties → Null.t<AuxValue>
-        if (ap && typeof ap === "object" && !Array.isArray((ap as any))) {
+        if (ap && typeof ap === "object") {
           const apObj = ap as SchemaObject;
-          if (Array.isArray((apObj as any).type)) {
-            const arr = (apObj as any).type as unknown[];
+          const apType = (apObj as { type?: unknown }).type;
+          if (Array.isArray(apType)) {
+            const arr = apType as unknown[];
             const hasNull = arr.includes("null");
             const hasObject = arr.includes("object");
             if (hasObject) {
               // Build a shallow object schema view for the object member
-              const recOnly: SchemaObject = { ...apObj, type: "object" } as any;
+              const recOnly = ({ ...apObj, type: "object" } as unknown) as SchemaObject;
               let recIR = mapSchemaToIR(recOnly, ctx, { parentName, collectAux, collectAuxIR, optionalAsOption, qualifyOpsRefs });
               if (recIR.kind === "withDoc" && recIR.inner.kind === "record") recIR = recIR.inner;
               if (recIR.kind === "record") {
@@ -1596,7 +1531,7 @@ function mapSchemaToIR(
             }
           }
         }
-        let valueIR = mapSchemaToIR(ap, ctx, { parentName, collectAux, collectAuxIR, optionalAsOption, qualifyOpsRefs });
+        let valueIR = mapSchemaToIR((ap as unknown) as SchemaObject, ctx, { parentName, collectAux, collectAuxIR, optionalAsOption, qualifyOpsRefs });
         // First-class value hoisting: create a stable aux for record or Null.t<record>
         let inner: TypeIR;
         if (valueIR.kind === "record") {
@@ -1605,9 +1540,9 @@ function mapSchemaToIR(
           inner = emitValueAux(valueIR.inner, valueIR.doc, false);
         } else if (isNullApp(valueIR)) {
           const a0 = valueIR.args[0];
-          if (a0 && (a0.kind === "record" || (a0.kind === "withDoc" && (a0 as any).inner?.kind === "record"))) {
-            const doc = a0.kind === "withDoc" ? (a0 as any).doc : undefined;
-            const rec0 = a0.kind === "withDoc" ? (a0 as any).inner : a0;
+          if (a0 && (a0.kind === "record" || (a0.kind === "withDoc" && a0.inner?.kind === "record"))) {
+            const doc = a0.kind === "withDoc" ? a0.doc : undefined;
+            const rec0 = a0.kind === "withDoc" ? a0.inner : a0;
             inner = emitValueAux(rec0, doc, true);
           } else {
             // Recurse to hoist deeper nested records under wrappers
@@ -1792,7 +1727,7 @@ function mapSchemaToIR(
       const arrayMembers = filtered.filter((r) => r && r.type === "array" && r.items && !Array.isArray(r.items)) as Array<SchemaObject & ArraySubtype>;
       if (arrayMembers.length > 0) {
         const itemsIRs = arrayMembers.map((am) =>
-          mapSchemaToIR(am.items!, ctx, {
+          mapSchemaToIR(am.items as SchemaLike, ctx, {
             parentName,
             collectAux,
             optionalAsOption,
@@ -1830,8 +1765,8 @@ function mapSchemaToIR(
         if (Array.isArray(r.enum) && r.enum.length > 0) {
           const allStrings = r.enum.every((v) => typeof v === "string");
           const allNumbers = r.enum.every((v) => typeof v === "number");
-          if (allStrings) enumSets.push({ kind: "string", values: (r.enum as any[]).map((x) => String(x)) });
-          else if (allNumbers) enumSets.push({ kind: "number", values: (r.enum as any[]).map((x) => String(x)) });
+          if (allStrings) enumSets.push({ kind: "string", values: (r.enum as unknown[]).map((x) => String(x)) });
+          else if (allNumbers) enumSets.push({ kind: "number", values: (r.enum as unknown[]).map((x) => String(x)) });
         }
       }
       if (enumSets.length > 0) {
@@ -2004,7 +1939,7 @@ function mapSchemaToIR(
   {
     let out: TypeIR = refIR("unknown");
     if (!isRef(schema)) {
-      const s: any = schema as SchemaObject;
+      const s = schema as SchemaObject;
       if (s && s.nullable) out = appIR(refIR("Null.t"), [out]);
     }
     return out;
@@ -2081,10 +2016,10 @@ function buildComponentsSchemas(
       registerUsedTypeName(typeName);
 
       // Detect simple untagged unions at component level and emit ADT + alias + codecs
-      const unionMembersTop = (schema as any).oneOf ?? (schema as any).anyOf;
+      const unionMembersTop = schema.oneOf ?? schema.anyOf;
       if (Array.isArray(unionMembersTop) && unionMembersTop.length > 0) {
-        const union = detectSimpleUntaggedUnion(unionMembersTop as SchemaLike[], ctx, (schema as any).discriminator);
-        if (union && (union as any).ok) {
+        const union = detectSimpleUntaggedUnion(unionMembersTop as SchemaLike[], ctx, schema.discriminator);
+        if (union.ok) {
           const adtName = toValidTypeName(`${typeName}_adt`);
           const aliasName = toValidTypeName(`${adtName}_wrapped`);
           // Reserve names to avoid collisions
@@ -2103,9 +2038,9 @@ function buildComponentsSchemas(
             const m = (unionMembersTop as SchemaLike[])[i]!;
             if (isRef(m)) {
               const rn = refName(m.$ref) ?? toValidTypeName(`member_${i + 1}`);
-              cases.push({ label: (union as any).labels[i]!, payload: refIR(rn) });
+              cases.push({ label: union.labels[i]!, payload: refIR(rn) });
             } else {
-              const payloadBase = toValidTypeName(`${typeName}_${(union as any).labels[i]}`);
+              const payloadBase = toValidTypeName(`${typeName}_${union.labels[i]}`);
               let irMem = mapSchemaToIR(m, ctx, {
                 parentName: payloadBase,
                 collectAux: (n, b) => {
@@ -2128,10 +2063,10 @@ function buildComponentsSchemas(
               const printed = printTypeIR(irMem);
               const auxNm = nameWithHash(payloadBase, printed);
               auxLocal.push({ name: auxNm, body: irMem });
-              cases.push({ label: (union as any).labels[i]!, payload: refIR(auxNm) });
+              cases.push({ label: union.labels[i]!, payload: refIR(auxNm) });
             }
           }
-          if ((union as any).allowUnknown) cases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
+          if (union.allowUnknown) cases.unshift({ label: "Unknown", payload: refIR("JSON.t") });
           if (auxLocal.length > 0) {
             for (const t of auxLocal) {
               if (!emittedAuxGlobal.has(t.name)) {
@@ -2150,9 +2085,9 @@ function buildComponentsSchemas(
           const litMapC = new Map<string, Array<{ value: string; label: string }>>();
           let sawKeysC = false;
           const keyPairsC: Array<{ prop: string; label: string }> = [];
-          for (let i = 0; i < (union as any).signals.length; i++) {
-            const sig = (union as any).signals[i]! as any;
-            const label = (union as any).labels[i]!;
+          for (let i = 0; i < union.signals.length; i++) {
+            const sig = union.signals[i]!;
+            const label = union.labels[i]!;
             if (sig.kind === "literal") {
               const arr = litMapC.get(sig.prop) ?? [];
               arr.push({ value: String(sig.value), label });
@@ -2164,7 +2099,7 @@ function buildComponentsSchemas(
             }
           }
           const buildTailOptC = (): string => {
-            let tail = (union as any).allowUnknown ? 'Some(UnionDecode.make("Unknown", json))' : 'None';
+            let tail = union.allowUnknown ? 'Some(UnionDecode.make("Unknown", json))' : 'None';
             for (let i = stepsC.length - 1; i >= 0; i--) {
               const st = stepsC[i]!;
               if (st.kind === "literal") {
@@ -2209,12 +2144,12 @@ function buildComponentsSchemas(
             [
               "Decoder for simple untagged union.",
               "Matching signals:",
-              ...(union as any).signals.map((s: any, i: number) =>
+              ...union.signals.map((s, i) =>
                 s.kind === "literal"
-                  ? `- ${(union as any).labels[i]!}: ${s.prop} == ${s.value}`
-                  : `- ${(union as any).labels[i]!}: has key ${s.prop}`
-              ),
-              (union as any).allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
+                  ? `- ${union.labels[i]!}: ${s.prop} == ${s.value}`
+                  : `- ${union.labels[i]!}: has key ${s.prop}`
+            ),
+              union.allowUnknown ? "Includes Unknown(JSON.t) fallback on no-match." : "No fallback; throws on no-match.",
             ].join("\n")
           );
           if (decDocC) postNodes.push({ kind: "raw", code: decDocC });
@@ -2227,7 +2162,7 @@ function buildComponentsSchemas(
           ]});
           // Done with this schema entry
           return;
-        } else if (union && !(union as any).ok) {
+        } else if (!union.ok) {
           // Ambiguous untagged union at components level → emit ADT + alias (encode-only)
           const adtName = toValidTypeName(`${typeName}_adt`);
           const aliasName = toValidTypeName(`${adtName}_wrapped`);
@@ -2368,8 +2303,8 @@ function buildComponentsSchemas(
     if (postNodes.length > 0) {
       const keep: RSNode[] = [];
       for (const n of postNodes) {
-        if ((n as any).kind === "raw") {
-          const code = (n as any).code as string;
+        if (n.kind === "raw") {
+          const code = n.code as string;
           if (typeof code === "string" && /^\s*and\s+[A-Za-z_][A-Za-z0-9_]*/.test(code)) {
             declNodes.push(n);
             continue;
@@ -2377,13 +2312,13 @@ function buildComponentsSchemas(
         }
         keep.push(n);
       }
-      (postNodes as any).length = 0;
-      (postNodes as any).push(...keep);
+      postNodes.length = 0;
+      postNodes.push(...keep);
     }
 
     // Expose all component-local type names (including aux and postNodes) for later qualification in Operations
-    for (const n of declNodes) if ((n as any).kind === "type") COMPONENT_SCHEMA_NAMES.add((n as any).name);
-    for (const n of postNodes) if ((n as any).kind === "type") COMPONENT_SCHEMA_NAMES.add((n as any).name);
+    for (const n of declNodes) if (n.kind === "type") COMPONENT_SCHEMA_NAMES.add(n.name);
+    for (const n of postNodes) if (n.kind === "type") COMPONENT_SCHEMA_NAMES.add(n.name);
     schemasItems.push(...declNodes);
     if (postNodes.length > 0) schemasItems.push(...postNodes);
   }
@@ -2717,10 +2652,10 @@ function buildOperations(
             if (chosenResolved && chosenResolved.schema) {
               // Detect simple untagged union for request body and emit ADT + alias + codec
               const union = ((): SimpleUnionDetection | undefined => {
-                const sch = isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>((chosenResolved!.schema as any).$ref) : (chosenResolved!.schema as any);
+                const sch = isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>(chosenResolved!.schema.$ref) : (chosenResolved!.schema as SchemaObject);
                 if (!sch) return undefined;
-                const members = (sch as any).oneOf ?? (sch as any).anyOf;
-                if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                const members = sch.oneOf ?? sch.anyOf;
+                if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, sch.discriminator);
                 return undefined;
               })();
 
@@ -2729,7 +2664,8 @@ function buildOperations(
                 const aliasName = toValidTypeName(`${adtName}_wrapped`);
                 const cases: Array<{ label: string; payload: TypeIR }> = [];
                 const auxLocal: Array<TypeDeclIR> = [];
-                const members = ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).oneOf ?? ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).anyOf;
+                const sch2 = isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>(chosenResolved.schema.$ref) : (chosenResolved.schema as SchemaObject);
+                const members = sch2?.oneOf ?? sch2?.anyOf;
                 for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                   const m = (members as SchemaLike[])[i]!;
                   if (isRef(m)) {
@@ -2789,7 +2725,7 @@ function buildOperations(
                 let sawKeys = false;
                 const keyPairs: Array<{ prop: string; label: string }> = [];
                 for (let i = 0; i < union.signals.length; i++) {
-                  const sig = union.signals[i]! as any;
+                  const sig = union.signals[i]!;
                   const label = union.labels[i]!;
                   if (sig.kind === "literal") {
                     const arr = litMap.get(sig.prop) ?? [];
@@ -2865,7 +2801,7 @@ function buildOperations(
                   if (union.allowUnknown) encLines.push(`  | Unknown(x) => Obj.magic(x)`);
                   for (let i = 0; i < union.labels.length; i++) {
                     const label = union.labels[i]!;
-                    const sig = union.signals[i]! as any;
+                    const sig = union.signals[i]!;
                     if (sig.kind === "literal") {
                       encLines.push(`  | ${label}(x) => Obj.magic(UnionEncode.ensureLiteral(x, ${JSON.stringify(sig.prop)}, ${JSON.stringify(String(sig.value))}))`);
                     } else {
@@ -2890,7 +2826,8 @@ function buildOperations(
                 const aliasName = toValidTypeName(`${adtName}_wrapped`);
                 const cases: Array<{ label: string; payload: TypeIR }> = [];
                 const auxLocal: Array<TypeDeclIR> = [];
-                const members = ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).oneOf ?? ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).anyOf;
+                const sch3 = isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>(chosenResolved.schema.$ref) : (chosenResolved.schema as SchemaObject);
+                const members = sch3?.oneOf ?? sch3?.anyOf;
                 for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                   const m = (members as SchemaLike[])[i]!;
                   if (isRef(m)) {
@@ -3070,10 +3007,10 @@ function buildOperations(
               if (chosen && chosen.schema) {
                 const base = toValidTypeName(`status_${status}_body`);
                 const union = ((): SimpleUnionDetection | undefined => {
-                  const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any);
+                  const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>(chosen!.schema.$ref) : (chosen!.schema as SchemaObject);
                   if (!sch) return undefined;
-                  const members = (sch as any).oneOf ?? (sch as any).anyOf;
-                  if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                  const members = sch.oneOf ?? sch.anyOf;
+                  if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, sch.discriminator);
                   return undefined;
                 })();
 
@@ -3084,7 +3021,8 @@ function buildOperations(
                   // Build payload types per member
                   const cases: Array<{ label: string; payload: TypeIR }> = [];
                   const auxLocal: Array<TypeDeclIR> = [];
-                  const members = ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).oneOf ?? ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).anyOf;
+                  const sch2 = isRef(chosen.schema) ? ctx.resolve<SchemaObject>(chosen.schema.$ref) : (chosen.schema as SchemaObject);
+                  const members = sch2?.oneOf ?? sch2?.anyOf;
                   for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                     const m = (members as SchemaLike[])[i]!;
                     if (isRef(m)) {
@@ -3144,7 +3082,7 @@ function buildOperations(
                   let sawKeys = false;
                   const keyPairs: Array<{ prop: string; label: string }> = [];
                   for (let i = 0; i < union.signals.length; i++) {
-                    const sig = union.signals[i]! as any;
+                    const sig = union.signals[i]!;
                     const label = union.labels[i]!;
                     if (sig.kind === "literal") {
                       const arr = litMap.get(sig.prop) ?? [];
@@ -3258,7 +3196,8 @@ function buildOperations(
                   const aliasName = toValidTypeName(`${adtName}_wrapped`);
                   const cases: Array<{ label: string; payload: TypeIR }> = [];
                   const auxLocal: Array<TypeDeclIR> = [];
-                  const members = ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).oneOf ?? ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).anyOf;
+                  const schX = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>(chosen!.schema.$ref) : (chosen!.schema as SchemaObject);
+                  const members = schX?.oneOf ?? schX?.anyOf;
                   for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                     const m = (members as SchemaLike[])[i]!;
                     if (isRef(m)) {
@@ -3304,7 +3243,7 @@ function buildOperations(
                   modItems.push({ kind: "type", keyword: "type rec", name: adtName, body: adtIR(cases) });
                   // Append aux types as part of the rec chain
                   for (const t of auxLocal) {
-                    if (!modItems.some((x) => x.kind === "type" && (x as any).name === t.name))
+                    if (!modItems.some((x) => x.kind === "type" && x.name === t.name))
                       modItems.push({ kind: "type", keyword: "and", name: t.name, body: qualifyComponentRefsIR(t.body) });
                   }
                   const codecModName = toValidModuleName(adtName);
@@ -3447,7 +3386,7 @@ function buildOperations(
                 const rec = recordIR([
                   { name: "data", typ: rawIR(pl) },
                   { name: "response", typ: refIR("Response.t") },
-                  { name: "headers", typ: refIR(headerTypeName) },
+                  { name: "headers", typ: refIR(headerTypeName!) },
                 ]);
                 variantAuxTypes.push({ name: resultTypeName, body: rec });
               }
@@ -3514,7 +3453,7 @@ function buildOperations(
             const flattened = recordIR([
               { name: "data", typ: rawIR(payloadTy) },
               { name: "response", typ: refIR("Response.t") },
-              { name: "headers", typ: refIR(headerTypeName) },
+              { name: "headers", typ: refIR(headerTypeName!) },
               { name: "status", typ: rawIR(`[#${s}]`) },
             ]);
             modItems.push({ kind: "type", keyword: "type", name: "success", body: flattened });
@@ -3697,10 +3636,10 @@ function buildOperations(
               if (chosenResolved && chosenResolved.schema) {
                 // Detect simple untagged union for callback request body and emit ADT + alias + codec
                 const union = ((): SimpleUnionDetection | undefined => {
-                  const sch = isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>((chosenResolved!.schema as any).$ref) : (chosenResolved!.schema as any);
+                  const sch = isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>(chosenResolved!.schema.$ref) : (chosenResolved!.schema as SchemaObject);
                   if (!sch) return undefined;
-                  const members = (sch as any).oneOf ?? (sch as any).anyOf;
-                  if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                  const members = sch.oneOf ?? sch.anyOf;
+                  if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, sch.discriminator);
                   return undefined;
                 })();
                 if (union && union.ok) {
@@ -3708,7 +3647,8 @@ function buildOperations(
                   const aliasName = toValidTypeName(`${adtName}_wrapped`);
                   const cases: Array<{ label: string; payload: TypeIR }> = [];
                   const auxLocal: Array<TypeDeclIR> = [];
-                  const members = ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).oneOf ?? ((isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>((chosenResolved.schema as any).$ref) : (chosenResolved.schema as any)) as any).anyOf;
+                  const sch2 = isRef(chosenResolved.schema) ? ctx.resolve<SchemaObject>(chosenResolved.schema.$ref) : (chosenResolved.schema as SchemaObject);
+                  const members = sch2?.oneOf ?? sch2?.anyOf;
                   for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                     const m = (members as SchemaLike[])[i]!;
                     if (isRef(m)) {
@@ -3761,7 +3701,7 @@ function buildOperations(
                   let sawKeys = false;
                   const keyPairs: Array<{ prop: string; label: string }> = [];
                   for (let i = 0; i < union.signals.length; i++) {
-                    const sig = union.signals[i]! as any;
+                    const sig = union.signals[i]!;
                     const label = union.labels[i]!;
                     if (sig.kind === "literal") {
                       const arr = litMap.get(sig.prop) ?? [];
@@ -3837,7 +3777,7 @@ function buildOperations(
                     if (union.allowUnknown) encLines.push(`  | Unknown(x) => Obj.magic(x)`);
                     for (let i = 0; i < union.labels.length; i++) {
                       const label = union.labels[i]!;
-                      const sig = union.signals[i]! as any;
+                      const sig = union.signals[i]!;
                       if (sig.kind === "literal") {
                         encLines.push(`  | ${label}(x) => Obj.magic(UnionEncode.ensureLiteral(x, ${JSON.stringify(sig.prop)}, ${JSON.stringify(String(sig.value))}))`);
                       } else {
@@ -3862,7 +3802,8 @@ function buildOperations(
                   const aliasName = toValidTypeName(`${adtName}_wrapped`);
                   const cases: Array<{ label: string; payload: TypeIR }> = [];
                   const auxLocal: Array<TypeDeclIR> = [];
-                  const members = ((isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>((chosenResolved!.schema as any).$ref) : (chosenResolved!.schema as any)) as any).oneOf ?? ((isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>((chosenResolved!.schema as any).$ref) : (chosenResolved!.schema as any)) as any).anyOf;
+                  const schY = isRef(chosenResolved!.schema) ? ctx.resolve<SchemaObject>(chosenResolved!.schema.$ref) : (chosenResolved!.schema as SchemaObject);
+                  const members = schY?.oneOf ?? schY?.anyOf;
                   for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                     const m = (members as SchemaLike[])[i]!;
                     if (isRef(m)) {
@@ -4011,10 +3952,10 @@ function buildOperations(
                     if (chosen && chosen.schema) {
                       const base = toValidTypeName(`status_${status}_body`);
                 const union = ((): SimpleUnionDetection | undefined => {
-                        const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any);
+                        const sch = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>(chosen!.schema.$ref) : (chosen!.schema as SchemaObject);
                         if (!sch) return undefined;
-                        const members = (sch as any).oneOf ?? (sch as any).anyOf;
-                        if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, (sch as any).discriminator);
+                        const members = sch.oneOf ?? sch.anyOf;
+                        if (Array.isArray(members) && members.length > 0) return detectSimpleUntaggedUnion(members as SchemaLike[], ctx, sch.discriminator);
                         return undefined;
                       })();
                       if (union && union.ok) {
@@ -4026,7 +3967,8 @@ function buildOperations(
                         const aliasName = toValidTypeName(`${adtName}_wrapped`);
                         const cases: Array<{ label: string; payload: TypeIR }> = [];
                         const auxLocal: Array<TypeDeclIR> = [];
-                        const members = ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).oneOf ?? ((isRef(chosen.schema) ? ctx.resolve<SchemaObject>((chosen.schema as any).$ref) : (chosen.schema as any)) as any).anyOf;
+                        const sch2 = isRef(chosen.schema) ? ctx.resolve<SchemaObject>(chosen.schema.$ref) : (chosen.schema as SchemaObject);
+                        const members = sch2?.oneOf ?? sch2?.anyOf;
                         for (let i = 0; i < (members as SchemaLike[]).length; i++) {
                           const m = (members as SchemaLike[])[i]!;
                           if (isRef(m)) {
@@ -4078,7 +4020,7 @@ function buildOperations(
                         let sawKeys2 = false;
                         const keyPairs2: Array<{ prop: string; label: string }> = [];
                         for (let i = 0; i < union.signals.length; i++) {
-                          const sig = union.signals[i]! as any;
+                          const sig = union.signals[i]!;
                           const label = union.labels[i]!;
                           if (sig.kind === "literal") {
                             const arr = litMap2.get(sig.prop) ?? [];
@@ -4183,7 +4125,7 @@ function buildOperations(
                           if (union.allowUnknown) encLines2.push(`  | Unknown(x) => Obj.magic(x)`);
                           for (let i = 0; i < union.labels.length; i++) {
                             const label = union.labels[i]!;
-                            const sig = union.signals[i]! as any;
+                            const sig = union.signals[i]!;
                             if (sig.kind === "literal") {
                               encLines2.push(`  | ${label}(x) => Obj.magic(UnionEncode.ensureLiteral(x, ${JSON.stringify(sig.prop)}, ${JSON.stringify(String(sig.value))}))`);
                             } else {
@@ -4213,7 +4155,8 @@ function buildOperations(
                           const aliasName = toValidTypeName(`${adtName}_wrapped`);
                           const casesAmb: Array<{ label: string; payload: TypeIR }> = [];
                           const auxLocalAmb: Array<TypeDeclIR> = [];
-                          const membersAmb = ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).oneOf ?? ((isRef(chosen!.schema) ? ctx.resolve<SchemaObject>((chosen!.schema as any).$ref) : (chosen!.schema as any)) as any).anyOf;
+                          const schAmb = isRef(chosen!.schema) ? ctx.resolve<SchemaObject>(chosen!.schema.$ref) : (chosen!.schema as SchemaObject);
+                          const membersAmb = schAmb?.oneOf ?? schAmb?.anyOf;
                           for (let i = 0; i < (membersAmb as SchemaLike[]).length; i++) {
                             const m = (membersAmb as SchemaLike[])[i]!;
                             if (isRef(m)) {
@@ -4386,7 +4329,7 @@ function buildOperations(
                       const rec = recordIR([
                         { name: "data", typ: rawIR(pl) },
                         { name: "response", typ: refIR("Response.t") },
-                        { name: "headers", typ: refIR(headerTypeName) },
+                        { name: "headers", typ: refIR(headerTypeName!) },
                       ]);
                       variantAuxTypes.push({ name: resultTypeName, body: rec });
                     }
@@ -4442,7 +4385,7 @@ function buildOperations(
                   const flattened = recordIR([
                     { name: "data", typ: rawIR(payloadTy) },
                     { name: "response", typ: refIR("Response.t") },
-                    { name: "headers", typ: refIR(headerTypeName) },
+                    { name: "headers", typ: refIR(headerTypeName!) },
                     { name: "status", typ: rawIR(`[#${s}]`) },
                   ]);
                   modItems.push({ kind: "type", keyword: "type", name: "success", body: flattened });
